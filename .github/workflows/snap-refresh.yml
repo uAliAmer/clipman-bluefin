@@ -1,0 +1,135 @@
+name: Snap refresh
+
+# Rebuilds the snap weekly to pick up Ubuntu archive security updates
+# (resolves the "outdated stage-packages" review emails). Also builds
+# on PRs/main pushes that touch snap-relevant paths so a packaging
+# break is caught early.
+#
+# Publishing to the Snap Store requires the SNAPCRAFT_STORE_CREDENTIALS
+# secret. Without it, build runs succeed and the artifact is uploaded
+# to the workflow run for manual inspection; publish is skipped.
+
+on:
+  schedule:
+    # Weekly Monday 04:00 UTC.
+    - cron: "0 4 * * 1"
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: "Snap Store channel to publish to"
+        type: choice
+        options: [edge, beta, candidate, stable]
+        default: edge
+      publish:
+        description: "Publish to the Snap Store (false = build artifact only)"
+        type: boolean
+        default: true
+  push:
+    branches: [main]
+    paths:
+      - 'snap/**'
+      - 'clipman/**'
+      - 'data/**'
+      - 'launcher.sh'
+      - 'clipman.py'
+      - 'pyproject.toml'
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [main]
+    paths:
+      - 'snap/**'
+      - 'clipman/**'
+      - 'data/**'
+      - 'launcher.sh'
+      - 'clipman.py'
+      - 'pyproject.toml'
+
+permissions: {}
+
+concurrency:
+  group: snap-refresh-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: Build snap
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      snap-file: ${{ steps.build.outputs.snap }}
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Build snap
+        id: build
+        uses: snapcore/action-build@3bdaa03e1ba6bf59a65f84a751d943d549a54e79 # v1.3.0
+
+      - name: Upload snap artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: clipman-snap-${{ github.run_id }}
+          path: ${{ steps.build.outputs.snap }}
+          retention-days: 14
+          if-no-files-found: error
+
+  publish:
+    name: Publish to Snap Store
+    needs: build
+    if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.publish) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - name: Download snap artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: clipman-snap-${{ github.run_id }}
+          path: ./snap-artifact
+
+      - name: Check credentials
+        id: creds
+        env:
+          STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+        run: |
+          if [ -z "$STORE_CREDENTIALS" ]; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::SNAPCRAFT_STORE_CREDENTIALS secret not set; skipping Snap Store publish. Add the secret to enable automatic publishing."
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve snap path
+        if: steps.creds.outputs.enabled == 'true'
+        id: resolve
+        run: |
+          snap_file=$(find ./snap-artifact -maxdepth 1 -name 'clipman_*.snap' -type f | head -n 1)
+          if [ -z "$snap_file" ]; then
+            echo "::error::Built snap not found in artifact"
+            exit 1
+          fi
+          echo "snap=$snap_file" >> "$GITHUB_OUTPUT"
+
+      - name: Publish to Snap Store
+        if: steps.creds.outputs.enabled == 'true'
+        uses: snapcore/action-publish@214b86e5ca036ead1668c79afb81e550e6c54d40 # v1.2.0
+        env:
+          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+        with:
+          snap: ${{ steps.resolve.outputs.snap }}
+          release: ${{ inputs.channel || 'edge' }}

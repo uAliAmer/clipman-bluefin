@@ -1,0 +1,45 @@
+[project]
+name = "clipman-clipboard"
+version = "1.1.0"
+description = "A Wayland-native clipboard history manager built with GTK 4 and libadwaita"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+authors = [
+    {name = "Mohammed El-sayed Ahmed"},
+]
+keywords = ["clipboard", "gnome", "wayland", "gtk", "linux"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: X11 Applications :: GTK",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Desktop Environment :: Gnome",
+]
+
+[project.urls]
+Homepage = "https://mohammedel-sayedahmed.github.io/clipman/"
+Documentation = "https://mohammedel-sayedahmed.github.io/clipman/"
+Repository = "https://github.com/MohammedEl-sayedAhmed/clipman"
+Issues = "https://github.com/MohammedEl-sayedAhmed/clipman/issues"
+Sponsor = "https://github.com/sponsors/MohammedEl-sayedAhmed"
+
+[project.scripts]
+clipman = "clipman.clipman:main"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["clipman*"]
+
+[tool.ruff]
+target-version = "py310"
+
+[tool.ruff.lint.per-file-ignores]
+# gi.require_version() must run before `from gi.repository import ...`,
+# which legitimately puts those imports below the require_version() call.
+"clipman/app.py" = ["E402"]
+"clipman/window.py" = ["E402"]

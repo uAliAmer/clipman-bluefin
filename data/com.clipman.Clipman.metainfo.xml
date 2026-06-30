@@ -1,0 +1,146 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.clipman.Clipman</id>
+  <name>Clipman</name>
+  <summary>Clipboard history manager for Wayland (GNOME, KDE, Sway, Hyprland)</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>Apache-2.0</project_license>
+  <developer id="com.github.MohammedEl-sayedAhmed">
+    <name>Mohammed El-sayed Ahmed</name>
+  </developer>
+
+  <description>
+    <p>
+      Clipman is a clipboard history manager for Wayland (GNOME, KDE, Sway, Hyprland).
+      Press Super+V to view your clipboard history, search entries, pin
+      favorites, and instantly paste previous copies — like Windows Win+V,
+      but for Linux.
+    </p>
+    <p>Features include:</p>
+    <ul>
+      <li>Clipboard history with text and image support</li>
+      <li>Full-text search across all entries</li>
+      <li>Pin important entries to keep them permanently</li>
+      <li>Inline editing and preview expansion</li>
+      <li>Incognito mode to pause history recording</li>
+      <li>Sensitive data detection with auto-clear</li>
+      <li>URL detection with one-click open</li>
+      <li>Reusable text snippets</li>
+      <li>Dark and light themes (Catppuccin)</li>
+      <li>Database backup and restore</li>
+      <li>Reusable text snippets with template variables (${date}, ${time}, ${clipboard})</li>
+      <li>wl-clipboard fallback for non-GNOME compositors (KDE, Sway, Hyprland)</li>
+      <li>16 carefully designed edge states (incognito, sensitive auto-clear, first-run, errors)</li>
+      <li>Terminal-aware paste (Ctrl+Shift+V)</li>
+    </ul>
+  </description>
+
+  <url type="homepage">https://mohammedel-sayedahmed.github.io/clipman/</url>
+  <url type="bugtracker">https://github.com/MohammedEl-sayedAhmed/clipman/issues</url>
+  <url type="vcs-browser">https://github.com/MohammedEl-sayedAhmed/clipman</url>
+  <url type="donation">https://github.com/sponsors/MohammedEl-sayedAhmed</url>
+  <url type="faq">https://mohammedel-sayedahmed.github.io/clipman/#faq</url>
+
+  <launchable type="desktop-id">com.clipman.Clipman.desktop</launchable>
+
+  <branding>
+    <color type="primary" scheme_preference="light">#dce0e8</color>
+    <color type="primary" scheme_preference="dark">#1e1e2e</color>
+  </branding>
+
+  <screenshots>
+    <screenshot type="default">
+      <image>https://raw.githubusercontent.com/MohammedEl-sayedAhmed/clipman/main/docs/dark-theme.png</image>
+      <caption>Clipman dark theme</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/MohammedEl-sayedAhmed/clipman/main/docs/light-theme.png</image>
+      <caption>Clipman light theme</caption>
+    </screenshot>
+  </screenshots>
+
+  <content_rating type="oars-1.1"/>
+
+  <requires>
+    <display_length compare="ge">360</display_length>
+  </requires>
+
+  <supports>
+    <control>keyboard</control>
+    <control>pointing</control>
+  </supports>
+
+  <releases>
+    <release version="1.1.0" date="2026-06-25">
+      <description>
+        <p>GTK 3 to GTK 4 + libadwaita port and Catppuccin palette overlay.</p>
+        <ul>
+          <li>Popup rebuilt as Adw.ApplicationWindow with Adw.HeaderBar and Adw.ActionRow rows</li>
+          <li>Settings extracted into a dedicated Adw.PreferencesWindow with six panes</li>
+          <li>Snippets editor is now an Adw.NavigationSplitView master-detail dialog</li>
+          <li>16 edge states (empty, no-results, incognito, sensitive-cleared, first-run, errors) render through Adw.StatusPage, Adw.Banner, and Adw.AlertDialog</li>
+          <li>Catppuccin Mocha and Latte palettes applied as overrides on libadwaita's named-color tokens</li>
+          <li>No D-Bus contract, schema, or settings-key changes; existing history and preferences carry over</li>
+        </ul>
+      </description>
+    </release>
+    <release version="1.0.6" date="2026-05-20">
+      <description>
+        <p>Catppuccin theme polish, snap-store auto-publish workflow, popup stability fixes.</p>
+      </description>
+    </release>
+    <release version="1.0.5" date="2026-05-20">
+      <description>
+        <p>Sensitive-data detection improvements and refreshed Catppuccin palettes.</p>
+      </description>
+    </release>
+    <release version="1.0.4" date="2026-03-07">
+      <description>
+        <p>D-Bus interface tightening and small popup bug fixes.</p>
+      </description>
+    </release>
+    <release version="1.0.3" date="2026-02-24">
+      <description>
+        <p>Standalone clipboard monitoring fallback.</p>
+        <ul>
+          <li>Added wl-paste --watch fallback when GNOME Shell extension is absent</li>
+          <li>Clipman now works on any Wayland compositor (KDE, Sway, Hyprland, etc.)</li>
+          <li>Automatic crash recovery for the watcher subprocess</li>
+        </ul>
+      </description>
+    </release>
+    <release version="1.0.2" date="2026-02-23">
+      <description>
+        <p>Packaging and security hardening patch.</p>
+        <ul>
+          <li>Hardened backup import against SQLite URI injection and malicious triggers</li>
+          <li>Added image magic bytes validation</li>
+          <li>Extended sensitive data detection patterns</li>
+        </ul>
+      </description>
+    </release>
+    <release version="1.0.1" date="2026-02-23">
+      <description>
+        <p>Patch release with clipboard reliability fix.</p>
+        <ul>
+          <li>Fixed unreliable clipboard detection with 150ms debounce</li>
+          <li>Fixed D-Bus slot name in Snap packaging</li>
+          <li>Added screenshots and donation URL to AppStream metadata</li>
+        </ul>
+      </description>
+    </release>
+    <release version="1.0.0" date="2026-02-22">
+      <description>
+        <p>Initial public release.</p>
+        <ul>
+          <li>Clipboard history with text and image support</li>
+          <li>GNOME Shell extension for native Wayland clipboard detection</li>
+          <li>Incognito mode, sensitive data auto-clear, inline edit</li>
+          <li>URL detection, snippet manager, backup/restore</li>
+          <li>Terminal-aware paste and cursor-positioned window</li>
+          <li>XWayland clipboard support (VSCode, Electron apps)</li>
+        </ul>
+      </description>
+    </release>
+  </releases>
+</component>

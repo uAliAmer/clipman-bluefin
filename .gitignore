@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+*.disabled
+*.log
+.ydotool_socket
+# user clipboard DB lives in ~/.local/share/clipman/, never here — belt & braces:
+clipman.db*
+data/clipman.db*

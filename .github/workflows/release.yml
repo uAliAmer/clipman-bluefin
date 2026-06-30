@@ -1,0 +1,738 @@
+name: Release
+
+# Tag-triggered release: builds and publishes to PyPI (via OIDC trusted
+# publishing), the Snap Store, and creates a GitHub Release with the
+# bundled GNOME Shell extension as an asset.
+#
+# Trigger by pushing a tag matching v*.*.* (e.g. v1.0.5). The workflow
+# verifies tag and pyproject.toml versions agree before publishing.
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (must already exist, e.g. v1.0.5)"
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  pre-flight:
+    name: Pre-flight checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.derive.outputs.tag }}
+      version: ${{ steps.derive.outputs.version }}
+      changelog: ${{ steps.changelog.outputs.notes }}
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - name: Checkout (with tag)
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Derive tag/version
+        id: derive
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${GITHUB_REF#refs/tags/}"
+          fi
+          version="${tag#v}"
+          echo "tag=$tag"        >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Check pyproject.toml version matches tag
+        env:
+          EXPECTED: ${{ steps.derive.outputs.version }}
+        run: |
+          actual=$(grep -m1 '^version = ' pyproject.toml | cut -d'"' -f2)
+          if [ "$actual" != "$EXPECTED" ]; then
+            echo "::error::pyproject.toml version ($actual) does not match tag ($EXPECTED)"
+            exit 1
+          fi
+          echo "OK: pyproject.toml $actual == tag $EXPECTED"
+
+      - name: Check snap/snapcraft.yaml version matches tag
+        env:
+          EXPECTED: ${{ steps.derive.outputs.version }}
+        run: |
+          actual=$(grep -m1 "^version: " snap/snapcraft.yaml | sed -E "s/version: ['\"]?([^'\"]+)['\"]?/\1/")
+          if [ "$actual" != "$EXPECTED" ]; then
+            echo "::error::snap/snapcraft.yaml version ($actual) does not match tag ($EXPECTED)"
+            exit 1
+          fi
+          echo "OK: snap version $actual == tag $EXPECTED"
+
+      - name: Extract release notes for this version from CHANGELOG.md
+        id: changelog
+        env:
+          VERSION: ${{ steps.derive.outputs.version }}
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import os, re
+          version = os.environ["VERSION"]
+          with open("CHANGELOG.md") as f:
+              text = f.read()
+          # Match "## [<version>]" then capture up to the next "## [" or EOF
+          pat = rf"(?ms)^##\s+\[{re.escape(version)}\][^\n]*\n(.*?)(?=^##\s+\[|\Z)"
+          m = re.search(pat, text)
+          notes = (m.group(1).strip() if m else
+                   f"Release v{version}. See CHANGELOG.md.")
+          print("notes<<EOF_NOTES")
+          print(notes)
+          print("EOF_NOTES")
+          PY
+
+  tests:
+    name: Tests (release verification)
+    needs: pre-flight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.pre-flight.outputs.tag }}
+          persist-credentials: false
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            gir1.2-gtk-3.0 python3-gi python3-dbus wl-clipboard \
+            libcairo2-dev libgirepository-2.0-dev || \
+          sudo apt-get install -y libgirepository1.0-dev
+
+      - name: Install Python dependencies
+        run: pip install PyGObject pydbus
+
+      - name: Run tests
+        run: python -m unittest discover -s tests
+
+  build-pypi:
+    name: Build PyPI artifacts
+    needs: [pre-flight, tests]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.pre-flight.outputs.tag }}
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+
+      - name: Install build tools
+        run: pip install build
+
+      - name: Build sdist + wheel
+        run: python -m build
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pypi-dist
+          path: dist/*
+          retention-days: 14
+          if-no-files-found: error
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: [pre-flight, build-pypi]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/project/clipman-clipboard/${{ needs.pre-flight.outputs.version }}
+    permissions:
+      id-token: write  # OIDC for trusted publishing
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - name: Download artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: pypi-dist
+          path: dist
+
+      - name: Publish to PyPI (OIDC trusted publishing)
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
+
+  build-snap:
+    name: Build snap
+    needs: [pre-flight, tests]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      snap-file: ${{ steps.build.outputs.snap }}
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.pre-flight.outputs.tag }}
+          persist-credentials: false
+
+      - name: Build snap
+        id: build
+        uses: snapcore/action-build@3bdaa03e1ba6bf59a65f84a751d943d549a54e79 # v1.3.0
+
+      - name: Upload snap artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: snap-release-${{ needs.pre-flight.outputs.tag }}
+          path: ${{ steps.build.outputs.snap }}
+          retention-days: 30
+          if-no-files-found: error
+
+  publish-snap:
+    name: Publish to Snap Store (stable)
+    needs: [pre-flight, build-snap]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - name: Download snap artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: snap-release-${{ needs.pre-flight.outputs.tag }}
+          path: ./snap-out
+
+      - name: Check credentials present
+        id: creds
+        env:
+          STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+        run: |
+          if [ -z "$STORE_CREDENTIALS" ]; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::SNAPCRAFT_STORE_CREDENTIALS not set; skipping snap publish"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve snap path
+        if: steps.creds.outputs.enabled == 'true'
+        id: resolve
+        run: |
+          snap_file=$(find ./snap-out -maxdepth 1 -name 'clipman_*.snap' -type f | head -n 1)
+          if [ -z "$snap_file" ]; then
+            echo "::error::No snap file found"
+            exit 1
+          fi
+          echo "snap=$snap_file" >> "$GITHUB_OUTPUT"
+
+      - name: Publish to Snap Store (stable channel)
+        if: steps.creds.outputs.enabled == 'true'
+        uses: snapcore/action-publish@214b86e5ca036ead1668c79afb81e550e6c54d40 # v1.2.0
+        env:
+          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+        with:
+          snap: ${{ steps.resolve.outputs.snap }}
+          release: stable
+
+  build-distpkgs:
+    name: Build .deb + .rpm
+    needs: [pre-flight, tests]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.pre-flight.outputs.tag }}
+          persist-credentials: false
+
+      - name: Install fpm + rpm tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ruby ruby-dev rubygems build-essential rpm
+          sudo gem install --no-document fpm -v 1.16.0
+
+      - name: Stage filesystem tree
+        env:
+          VERSION: ${{ needs.pre-flight.outputs.version }}
+        run: |
+          stage=staging
+          rm -rf "$stage"
+          install -d "$stage"/usr/lib/clipman
+          install -d "$stage"/usr/lib/clipman/clipman
+          install -d "$stage"/usr/lib/clipman/extension
+          install -d "$stage"/usr/bin
+          install -d "$stage"/usr/share/applications
+          install -d "$stage"/usr/share/icons/hicolor/scalable/apps
+          install -d "$stage"/usr/share/doc/clipman-clipboard
+          install -d "$stage"/usr/share/clipman
+
+          # Python package + entry script
+          cp -r clipman/* "$stage"/usr/lib/clipman/clipman/
+          install -Dm755 clipman.py "$stage"/usr/lib/clipman/clipman.py
+          install -Dm755 launcher.sh "$stage"/usr/lib/clipman/launcher.sh
+
+          # Bundle extension source so install-extension subcommand can find it
+          cp extension/extension.js "$stage"/usr/lib/clipman/extension/
+          cp extension/metadata.json "$stage"/usr/lib/clipman/extension/
+
+          # /usr/bin/clipman wrapper
+          cat > "$stage"/usr/bin/clipman <<'EOF'
+          #!/bin/sh
+          exec /usr/lib/clipman/clipman.py "$@"
+          EOF
+          chmod 0755 "$stage"/usr/bin/clipman
+
+          # .desktop file (the placeholder install.sh rewrites at source-install
+          # time; for system install, point it at /usr/bin/clipman directly)
+          sed "s|CLIPMAN_PATH_PLACEHOLDER|/usr/lib/clipman|g" \
+            data/com.clipman.Clipman.desktop \
+            > "$stage"/usr/share/applications/com.clipman.Clipman.desktop
+
+          # Icon
+          cp data/com.clipman.Clipman.svg \
+            "$stage"/usr/share/icons/hicolor/scalable/apps/com.clipman.Clipman.svg
+
+          # AppStream metadata
+          cp data/com.clipman.Clipman.metainfo.xml "$stage"/usr/share/clipman/
+
+          # Docs
+          cp README.md LICENSE NOTICE CHANGELOG.md \
+            "$stage"/usr/share/doc/clipman-clipboard/
+
+          # Sanity: print the tree (first 40 entries)
+          find "$stage" -maxdepth 5 | head -40
+
+      - name: Build .deb
+        env:
+          VERSION: ${{ needs.pre-flight.outputs.version }}
+        run: |
+          fpm -s dir -t deb -p clipman_${VERSION}_all.deb \
+            --name clipman-clipboard \
+            --version "$VERSION" \
+            --architecture all \
+            --license Apache-2.0 \
+            --maintainer "MohammedEl-sayedAhmed <noreply@github.com>" \
+            --url "https://github.com/MohammedEl-sayedAhmed/clipman" \
+            --description "Clipboard history manager for GNOME on Wayland.\nDesktop integration (GNOME Shell extension + keybinding) is\nper-user; run /usr/share/doc/clipman-clipboard/README.md or the\nupstream install.sh inside this user session to enable it." \
+            --depends python3 \
+            --depends python3-gi \
+            --depends python3-dbus \
+            --depends gir1.2-gtk-3.0 \
+            --depends wl-clipboard \
+            -C staging .
+
+      - name: Build .rpm
+        env:
+          VERSION: ${{ needs.pre-flight.outputs.version }}
+        run: |
+          fpm -s dir -t rpm -p clipman-${VERSION}-1.noarch.rpm \
+            --name clipman-clipboard \
+            --version "$VERSION" \
+            --architecture noarch \
+            --license Apache-2.0 \
+            --maintainer "MohammedEl-sayedAhmed <noreply@github.com>" \
+            --url "https://github.com/MohammedEl-sayedAhmed/clipman" \
+            --description "Clipboard history manager for GNOME on Wayland." \
+            --depends python3 \
+            --depends python3-gobject \
+            --depends python3-dbus \
+            --depends gtk3 \
+            --depends wl-clipboard \
+            -C staging .
+
+      - name: Upload .deb + .rpm artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: distpkgs-${{ needs.pre-flight.outputs.tag }}
+          path: |
+            clipman_*.deb
+            clipman-*.rpm
+          retention-days: 30
+          if-no-files-found: error
+
+  build-appimage:
+    name: Build AppImage
+    needs: [pre-flight, build-pypi]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.pre-flight.outputs.tag }}
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+
+      - name: Download PyPI wheel artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: pypi-dist
+          path: dist
+
+      - name: Install python-appimage + FUSE2
+        run: |
+          sudo apt-get update
+          # Ubuntu 24.04 (noble) renamed libfuse2 -> libfuse2t64 (time_t transition).
+          # Prefer the t64 package; fall back to libfuse2 for older runners.
+          sudo apt-get install -y libfuse2t64 || sudo apt-get install -y libfuse2
+          pip install python-appimage==1.4.5
+
+      - name: Stage app recipe
+        env:
+          VERSION: ${{ needs.pre-flight.outputs.version }}
+        run: |
+          stage=appimage-src
+          rm -rf "$stage"
+          install -d "$stage"
+          # Entrypoint
+          cat > "$stage/entrypoint.sh" <<'EOF'
+          #!/bin/sh
+          "{{ python-executable }}" -m clipman.app "$@"
+          EOF
+          chmod +x "$stage/entrypoint.sh"
+
+          # Requirements file points python-appimage to install our wheel.
+          cp dist/clipman_clipboard-${VERSION}-py3-none-any.whl "$stage"/
+          cat > "$stage/requirements.txt" <<EOF
+          ./clipman_clipboard-${VERSION}-py3-none-any.whl
+          EOF
+
+          # .desktop + icon required by AppImage spec.
+          cat > "$stage/clipman.desktop" <<'EOF'
+          [Desktop Entry]
+          Name=Clipman
+          Comment=Clipboard history manager for GNOME on Wayland
+          Exec=clipman
+          Icon=clipman
+          Terminal=false
+          Type=Application
+          Categories=Utility;
+          EOF
+          cp data/com.clipman.Clipman.svg "$stage/clipman.svg"
+
+      - name: Build AppImage
+        env:
+          VERSION: ${{ needs.pre-flight.outputs.version }}
+        run: |
+          # python-appimage bundles Python 3.12 + wheel. NOT bundled: GTK
+          # runtime, PyGObject bindings — those still need to be installed
+          # system-wide (python3-gi + gir1.2-gtk-3.0). Documented in the
+          # release notes Assets section.
+          python-appimage build app -p 3.12 appimage-src/ || \
+            echo "::warning::AppImage build failed — Python-GTK packaging is brittle. \
+            Continuing without the AppImage artifact; .deb/.rpm/snap/pypi all built fine."
+          # Rename to a deterministic name if the build succeeded.
+          built=$(ls Clipman*-x86_64.AppImage 2>/dev/null | head -n 1 || true)
+          if [ -n "$built" ]; then
+            mv "$built" "clipman-${VERSION}-x86_64.AppImage"
+            ls -l "clipman-${VERSION}-x86_64.AppImage"
+          fi
+
+      - name: Upload AppImage artifact (if produced)
+        if: hashFiles('clipman-*-x86_64.AppImage') != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: appimage-${{ needs.pre-flight.outputs.tag }}
+          path: clipman-*-x86_64.AppImage
+          retention-days: 30
+          if-no-files-found: warn
+
+  bundle-extension:
+    name: Bundle GNOME Shell extension
+    needs: [pre-flight, tests]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.pre-flight.outputs.tag }}
+          persist-credentials: false
+
+      - name: Install gnome-extensions tool
+        run: sudo apt-get update && sudo apt-get install -y gnome-shell-extensions
+
+      - name: Pack extension
+        run: |
+          gnome-extensions pack \
+            --force \
+            --out-dir=. \
+            extension
+          # Rename to a version-tagged file so GH Release asset is unambiguous.
+          built=$(ls clipman@clipman.com.shell-extension.zip)
+          mv "$built" "clipman-extension-${{ needs.pre-flight.outputs.tag }}.zip"
+
+      - name: Upload extension bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: extension-bundle-${{ needs.pre-flight.outputs.tag }}
+          path: clipman-extension-${{ needs.pre-flight.outputs.tag }}.zip
+          retention-days: 30
+          if-no-files-found: error
+
+  github-release:
+    name: Create GitHub Release
+    needs: [pre-flight, publish-pypi, publish-snap, bundle-extension, build-distpkgs, build-appimage]
+    if: always() && needs.pre-flight.result == 'success' && needs.bundle-extension.result == 'success' && needs.build-distpkgs.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - name: Download PyPI artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: pypi-dist
+          path: release-assets
+
+      - name: Download snap artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: snap-release-${{ needs.pre-flight.outputs.tag }}
+          path: release-assets
+
+      - name: Download extension bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: extension-bundle-${{ needs.pre-flight.outputs.tag }}
+          path: release-assets
+
+      - name: Download .deb + .rpm
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: distpkgs-${{ needs.pre-flight.outputs.tag }}
+          path: release-assets
+
+      - name: Download AppImage (optional)
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        continue-on-error: true
+        with:
+          name: appimage-${{ needs.pre-flight.outputs.tag }}
+          path: release-assets
+
+      - name: List assembled assets
+        run: ls -lh release-assets
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
+        with:
+          tag_name: ${{ needs.pre-flight.outputs.tag }}
+          name: Clipman ${{ needs.pre-flight.outputs.tag }}
+          body: |
+            ${{ needs.pre-flight.outputs.changelog }}
+
+            ---
+
+            ## Assets
+
+            | File | Use case | Channel |
+            |------|----------|---------|
+            | `clipman_clipboard-*.whl` | `pip install --upgrade clipman-clipboard` | PyPI (also auto-published) |
+            | `clipman_clipboard-*.tar.gz` | source build via `pip install` | PyPI (also auto-published) |
+            | `clipman_*.deb` | `sudo apt install ./clipman_*.deb` | Debian / Ubuntu (system) |
+            | `clipman-*.rpm` | `sudo dnf install ./clipman-*.rpm` | Fedora / RHEL / openSUSE (system) |
+            | `clipman_*.snap` | `sudo snap install --dangerous ./clipman_*.snap` | Any distro w/ snapd (also auto-published to Snap Store stable) |
+            | `clipman-*-x86_64.AppImage` | `chmod +x ./clipman-*.AppImage && ./clipman-*.AppImage` | Any glibc Linux (requires system `python3-gi`/`python3-dbus`) |
+            | `clipman-extension-*.zip` | upload at <https://extensions.gnome.org/upload/> or unzip into `~/.local/share/gnome-shell/extensions/` | GNOME Extensions website (manual) |
+            | `Source code (zip / tar.gz)` | auto-generated by GitHub | git checkout |
+
+            **Important install caveats**
+
+            - The `.deb` / `.rpm` install the daemon to `/usr/bin/clipman` and the Python module to `/usr/lib/clipman/`, but **do not** install the GNOME Shell extension or register the `Super+V` keybinding — those are per-user. After installing the package, run upstream `install.sh` from a source checkout, or follow the per-user setup in `docs/development.md`.
+            - The `AppImage` bundles a Python 3.12 runtime + clipman, but **not** GTK or PyGObject. It still requires system `python3-gi` + `gir1.2-gtk-3.0` packages installed (almost every desktop Linux already has them). GTK can't be trivially bundled in an AppImage; if a full self-contained binary is critical, the Snap or Flatpak builds are better fits.
+
+            ### GNOME Shell extension (manual step — EGO has no upload API)
+
+            Download `clipman-extension-${{ needs.pre-flight.outputs.tag }}.zip` and upload it at <https://extensions.gnome.org/upload/>. Existing source installs pick up the new extension automatically via `install.sh`.
+          draft: false
+          prerelease: false
+          # Tolerate missing patterns: the AppImage build is best-effort
+          # (Python+GTK packaging is brittle). We'd rather ship a release
+          # without the AppImage than fail the whole pipeline on that one
+          # glob. .deb / .rpm / snap / extension / wheel / sdist are all
+          # produced by required-success jobs, so a missing one of those
+          # would already have failed an upstream job before we got here.
+          fail_on_unmatched_files: false
+          files: |
+            release-assets/clipman-extension-${{ needs.pre-flight.outputs.tag }}.zip
+            release-assets/clipman_*.snap
+            release-assets/clipman_clipboard-*.tar.gz
+            release-assets/clipman_clipboard-*.whl
+            release-assets/clipman_*.deb
+            release-assets/clipman-*.rpm
+            release-assets/clipman-*-x86_64.AppImage
+
+  publish-aur:
+    # Refresh the AUR package after a successful GitHub Release.
+    #
+    # Requires the AUR_SSH_PRIVATE_KEY secret to be set (ed25519 private
+    # key whose public counterpart is registered on the AUR maintainer's
+    # account). Without the secret, this job logs a warning and exits
+    # cleanly - same pattern as publish-snap with SNAPCRAFT_STORE_CREDENTIALS.
+    name: Publish to AUR
+    needs: [pre-flight, github-release]
+    if: >-
+      always()
+      && needs.pre-flight.result == 'success'
+      && needs.github-release.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Check credentials
+        id: creds
+        env:
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          if [ -z "$AUR_SSH_KEY" ]; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::AUR_SSH_PRIVATE_KEY secret not set; skipping AUR publish. Add the secret to enable automatic AUR refresh."
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install SSH key
+        if: steps.creds.outputs.enabled == 'true'
+        uses: webfactory/ssh-agent@e83874834305fe9a4a2997156cb26c5de65a8555 # v0.10.0
+        with:
+          ssh-private-key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+
+      - name: Pin AUR host key
+        if: steps.creds.outputs.enabled == 'true'
+        run: |
+          # Pin the known AUR host keys so a MITM can't redirect the push.
+          # Fingerprints from https://aur.archlinux.org/ "SSH fingerprints" section.
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          # SHA256 fingerprints (verified against https://aur.archlinux.org/):
+          #   ed25519: SHA256:RFzBCUItH9LZS0cKB5UE6ceAYhBD5C8GeOBip8Z11+4
+          #   ecdsa:   SHA256:uTa/0PndEgPZTf76e1DFqXKJEXKsn7m9ivhLQtzGOCI
+          #   rsa:     SHA256:5s5cIyReIfNNVGRFdDbe3hdYiI5OelHGpw2rOUud3Q8
+          cat > ~/.ssh/known_hosts <<'EOF'
+          aur.archlinux.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEuBKrPzbawxA/k2g6NcyV5jmqwJ2s+zpgZGZ7tpLIcN
+          aur.archlinux.org ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBLMiLrP8pVi5BFX2i3vepSUnpedeiewE5XptnUnau+ZoeUOPkpoCgZZuYfpaIQfhhJJI5qgnjJmr4hyJbe/zxow=
+          aur.archlinux.org ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDKF9vAFWdgm9Bi8uc+tYRBmXASBb5cB5iZsB7LOWWFeBrLp3r14w0/9S2vozjgqY5sJLDPONWoTTaVTbhe3vwO8CBKZTEt1AcWxuXNlRnk9FliR1/eNB9uz/7y1R0+c1Md+P98AJJSJWKN12nqIDIhjl2S1vOUvm7FNY43fU2knIhEbHybhwWeg+0wxpKwcAd/JeL5i92Uv03MYftOToUijd1pqyVFdJvQFhqD4v3M157jxS5FTOBrccAEjT+zYmFyD8WvKUa9vUclRddNllmBJdy4NyLB8SvVZULUPrP3QOlmzemeKracTlVOUG1wsDbxknF1BwSCU7CmU6UFP90kpWIyz66bP0bl67QAvlIc52Yix7pKJPbw85+zykvnfl2mdROsaT8p8R9nwCdFsBc9IiD0NhPEHcyHRwB8fokXTajk2QnGhL+zP5KnkmXnyQYOCUYo3EKMXIlVOVbPDgRYYT/XqvBuzq5S9rrU70KoI/S5lDnFfx/+lPLdtcnnEPk=
+          EOF
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Refresh AUR metadata
+        if: steps.creds.outputs.enabled == 'true'
+        run: ./scripts/update-aur.sh
+
+      - name: Push to AUR
+        if: steps.creds.outputs.enabled == 'true'
+        env:
+          VERSION: ${{ needs.pre-flight.outputs.version }}
+        run: |
+          # Clone the AUR repo, replace the two files we manage, commit, push.
+          # No `.git` history from this repo leaks into the AUR repo.
+          aur_clone=$(mktemp -d)
+          git clone ssh://aur@aur.archlinux.org/clipman-clipboard.git "$aur_clone"
+          cp aur/PKGBUILD aur/.SRCINFO "$aur_clone/"
+          cd "$aur_clone"
+          if git diff --quiet PKGBUILD .SRCINFO; then
+            echo "AUR is already at $VERSION; nothing to push."
+            exit 0
+          fi
+          git -c user.email="57391064+MohammedEl-sayedAhmed@users.noreply.github.com" \
+              -c user.name="MohammedEl-sayedAhmed" \
+              commit -am "Update to $VERSION"
+          git push

@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# commit-msg hook: reject commits whose message contains AI/Claude
+# footprints or trailers citing an account outside the allowlist.
+
+# shellcheck source=.githooks/_lib.sh
+. "$(dirname -- "$(readlink -f -- "$0" 2>/dev/null || printf '%s' "$0")")/_lib.sh"
+
+msg_file="${1:?commit-msg hook requires the message file path}"
+
+failed=0
+
+# Footprint scan on the full message body — catches AI/Claude-style
+# attribution patterns no matter where they appear in the message.
+if ! scan_footprints "$msg_file"; then
+    failed=1
+fi
+
+# Trailer-identity scan. Only safe identity classes are allowed in
+# Co-Authored-By / Signed-off-by / Reviewed-by / etc. trailers: the
+# owner allowlist, GitHub privacy-alias noreplies, and GitHub's
+# web-flow merge identity. Raw personal/work domain emails are blocked
+# at this layer — use the privacy-alias form of the email instead.
+# (See is_safe_trailer_email in _lib.sh for the exact policy.)
+if ! scan_trailer_identities "$msg_file"; then
+    failed=1
+fi
+
+if [ "$failed" -eq 0 ]; then
+    hook_ok "commit message: clean"
+    exit 0
+fi
+
+hook_section "commit aborted"
+hook_detail "Edit the commit message to remove the highlighted content, then commit again."
+hook_detail "Bypass once (NOT recommended): git commit --no-verify"
+exit 1

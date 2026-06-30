@@ -1,0 +1,105 @@
+#!/bin/bash
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+CLIPMAN_PY="$SCRIPT_DIR/clipman.py"
+AUTOSTART_DIR="$HOME/.config/autostart"
+DATA_DIR="$HOME/.local/share/clipman"
+EXTENSION_UUID="clipman@clipman.com"
+EXTENSION_DIR="$HOME/.local/share/gnome-shell/extensions/$EXTENSION_UUID"
+
+echo "=== Installing Clipman ==="
+
+# Determine package manager
+if command -v dnf &> /dev/null; then
+    PKG_MANAGER="dnf"
+elif command -v apt &> /dev/null; then
+    PKG_MANAGER="apt"
+else
+    echo "Error: No supported package manager found (apt or dnf)"
+    exit 1
+fi
+
+# Step 1: Install system dependencies
+echo "[1/6] Installing dependencies..."
+if [ "$PKG_MANAGER" = "apt" ]; then
+    echo "  [skip] apt deps (atomic host, deps pre-satisfied)"
+elif [ "$PKG_MANAGER" = "dnf" ]; then
+    echo "  [skip] dnf deps (atomic host, deps pre-satisfied)"
+fi
+
+# Step 2: Create data directories
+echo "[2/6] Creating data directories..."
+mkdir -p "$DATA_DIR/images"
+mkdir -p "$AUTOSTART_DIR"
+
+# Step 3: Install GNOME Shell extension for native clipboard monitoring
+echo "[3/6] Installing GNOME Shell clipboard extension..."
+mkdir -p "$EXTENSION_DIR"
+cp "$SCRIPT_DIR/extension/metadata.json" "$EXTENSION_DIR/"
+cp "$SCRIPT_DIR/extension/extension.js" "$EXTENSION_DIR/"
+gnome-extensions enable "$EXTENSION_UUID" 2>/dev/null || true
+echo "  Extension installed. You may need to log out and back in to activate it."
+
+# Step 4: Generate and install autostart desktop file + icon
+echo "[4/6] Setting up autostart..."
+sed "s|CLIPMAN_PATH_PLACEHOLDER|$SCRIPT_DIR|g" "$SCRIPT_DIR/data/com.clipman.Clipman.desktop" > "$AUTOSTART_DIR/com.clipman.Clipman.desktop"
+ICON_DIR="$HOME/.local/share/icons/hicolor/scalable/apps"
+mkdir -p "$ICON_DIR"
+cp "$SCRIPT_DIR/data/com.clipman.Clipman.svg" "$ICON_DIR/"
+
+# Step 5: Register Super+V keybinding
+echo "[5/6] Registering Super+V keyboard shortcut..."
+
+CUSTOM_KEYS_PATH="/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings"
+CLIPMAN_KEY_PATH="$CUSTOM_KEYS_PATH/clipman/"
+
+# Get existing custom keybindings
+EXISTING=$(gsettings get org.gnome.settings-daemon.plugins.media-keys custom-keybindings 2>/dev/null || echo "[]")
+
+# Check if clipman binding already exists
+if echo "$EXISTING" | grep -q "clipman"; then
+    echo "  Keybinding already registered."
+else
+    # Add clipman to the list
+    if [ "$EXISTING" = "@as []" ] || [ "$EXISTING" = "[]" ]; then
+        NEW_LIST="['$CLIPMAN_KEY_PATH']"
+    else
+        # Remove trailing ] and append
+        NEW_LIST=$(echo "$EXISTING" | sed "s|]$|, '$CLIPMAN_KEY_PATH']|")
+    fi
+    gsettings set org.gnome.settings-daemon.plugins.media-keys custom-keybindings "$NEW_LIST"
+fi
+
+# Remove Super+V from GNOME's built-in message tray toggle (conflicts with our binding)
+CURRENT_MSG_TRAY=$(gsettings get org.gnome.shell.keybindings toggle-message-tray 2>/dev/null || echo "[]")
+if echo "$CURRENT_MSG_TRAY" | grep -q "'<Super>v'"; then
+    gsettings set org.gnome.shell.keybindings toggle-message-tray "['<Super>m']"
+    echo "  Removed Super+V from GNOME message tray (Super+M still works)."
+fi
+
+# Set the keybinding properties
+gsettings set "org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:${CLIPMAN_KEY_PATH}" name "Clipman Toggle"
+gsettings set "org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:${CLIPMAN_KEY_PATH}" command "$SCRIPT_DIR/launcher.sh toggle"
+gsettings set "org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:${CLIPMAN_KEY_PATH}" binding "<Super>v"
+
+# Step 6: Install systemd user service (auto-restart on crash)
+echo "[6/6] Installing systemd user service..."
+SYSTEMD_DIR="$HOME/.config/systemd/user"
+mkdir -p "$SYSTEMD_DIR"
+sed "s|CLIPMAN_PATH_PLACEHOLDER|$SCRIPT_DIR|g" "$SCRIPT_DIR/data/clipman.service" > "$SYSTEMD_DIR/clipman.service"
+systemctl --user daemon-reload
+systemctl --user enable clipman.service 2>/dev/null || true
+echo "  Service installed. It will start automatically on login."
+
+echo ""
+echo "=== Installation Complete ==="
+echo ""
+echo "IMPORTANT: Log out and back in to activate the clipboard extension."
+echo ""
+echo "Usage:"
+echo "  Start daemon:  python3 $CLIPMAN_PY"
+echo "  Toggle popup:  Super+V (or: python3 $CLIPMAN_PY toggle)"
+echo ""
+echo "The daemon will autostart on your next login."
+echo "To start it now, run: python3 $CLIPMAN_PY &"

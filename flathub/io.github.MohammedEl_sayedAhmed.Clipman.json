@@ -1,0 +1,57 @@
+{
+    "app-id": "io.github.MohammedEl_sayedAhmed.Clipman",
+    "runtime": "org.gnome.Platform",
+    "runtime-version": "49",
+    "sdk": "org.gnome.Sdk",
+    "command": "clipman",
+    "finish-args": [
+        "--share=ipc",
+        "--socket=wayland",
+        "--socket=fallback-x11",
+        "--talk-name=org.gnome.Shell",
+        "--talk-name=org.gnome.Shell.Extensions.clipman"
+    ],
+    "modules": [
+        {
+            "name": "wl-clipboard",
+            "buildsystem": "meson",
+            "config-opts": ["-Dfishcompletiondir=no"],
+            "sources": [
+                {
+                    "type": "archive",
+                    "url": "https://github.com/bugaevc/wl-clipboard/archive/refs/tags/v2.2.1.tar.gz",
+                    "sha256": "6eb8081207fb5581d1d82c4bcd9587205a31a3d47bea3ebeb7f41aa1143783eb"
+                }
+            ]
+        },
+        {
+            "name": "clipman",
+            "buildsystem": "simple",
+            "build-commands": [
+                "install -d /app/share/clipman",
+                "cp -r clipman/ /app/share/clipman/clipman/",
+                "cp clipman.py /app/share/clipman/",
+                "cp launcher.sh /app/share/clipman/",
+                "chmod +x /app/share/clipman/launcher.sh",
+                "install -Dm644 data/io.github.MohammedEl_sayedAhmed.Clipman.desktop /app/share/applications/io.github.MohammedEl_sayedAhmed.Clipman.desktop",
+                "install -Dm644 data/com.clipman.Clipman.svg /app/share/icons/hicolor/scalable/apps/io.github.MohammedEl_sayedAhmed.Clipman.svg",
+                "install -Dm644 data/io.github.MohammedEl_sayedAhmed.Clipman.metainfo.xml /app/share/metainfo/io.github.MohammedEl_sayedAhmed.Clipman.metainfo.xml",
+                "install -Dm755 clipman-wrapper.sh /app/bin/clipman"
+            ],
+            "sources": [
+                {
+                    "type": "archive",
+                    "url": "https://github.com/MohammedEl-sayedAhmed/clipman/archive/refs/tags/v1.1.0.tar.gz",
+                    "sha256": "bb5f2ccfb41eea1bf92bfe76fb1b786bb14f782782f155b2575f72d7859cc116"
+                },
+                {
+                    "type": "script",
+                    "dest-filename": "clipman-wrapper.sh",
+                    "commands": [
+                        "exec python3 /app/share/clipman/clipman.py \"$@\""
+                    ]
+                }
+            ]
+        }
+    ]
+}

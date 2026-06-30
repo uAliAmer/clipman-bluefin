@@ -1,0 +1,310 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [main]
+  schedule:
+    - cron: "27 4 * * 1"
+  workflow_dispatch:
+
+permissions: {}
+
+# On push to main, each commit needs its own analyze + update-baseline
+# run so the security-baseline branch stays in sync with current main.
+# A ref-scoped concurrency group with cancel-in-progress: false caused
+# GitHub Actions to drop subsequent pushes whose queued slot would have
+# otherwise waited behind an in-progress run, leaving the baseline
+# pinned to an older commit. Splitting the group key by event:
+#   push       -> per-SHA group (every commit gets its own slot, never collides);
+#   pull_request -> per-PR group with cancel-in-progress true (saves runner minutes on re-pushes);
+#   schedule   -> per-workflow group (only one weekly run at a time is fine).
+# workflow_dispatch is enabled below as a manual escape hatch in case
+# a future push ever does get dropped — we can refresh the baseline
+# without waiting for the next push to main.
+concurrency:
+  group: codeql-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    env:
+      # Disable diff-informed query filtering. The feature builds a
+      # pr-diff-range.yml that depends on git merge-base resolution,
+      # which is flaky on this repo (error processing shallow info: 4).
+      # Full-codebase analysis is acceptable for a project this size.
+      CODEQL_ACTION_DIFF_INFORMED_QUERIES: false
+
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [python, javascript]
+
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4.36.2
+        with:
+          languages: ${{ matrix.language }}
+          queries: security-and-quality
+
+      - name: Perform CodeQL Analysis
+        id: analyze
+        uses: github/codeql-action/analyze@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4.36.2
+        with:
+          category: "/language:${{ matrix.language }}"
+          output: ./codeql-results
+          upload: always
+
+      - name: Upload SARIF artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: codeql-sarif-${{ matrix.language }}
+          path: ./codeql-results
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Fetch security baseline
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch origin security-baseline --depth=1 2>/dev/null && \
+            git show origin/security-baseline:.github/security-baseline.json \
+              > /tmp/security-baseline.json || \
+            echo '{"codeql":{"fingerprints":[]}}' > /tmp/security-baseline.json
+          echo "::group::Loaded baseline"
+          cat /tmp/security-baseline.json
+          echo "::endgroup::"
+
+      - name: Ratchet against baseline (${{ matrix.language }})
+        # PR-only: on push to main, the update-baseline job downstream
+        # rebuilds the baseline from the fresh SARIF instead. Running
+        # the ratchet on push would fail when main itself shifts lines
+        # vs. the older baseline, which would in turn block update-baseline
+        # (it needs analyze to succeed) — a deadlock that traps the
+        # baseline on whatever state it was first written with.
+        if: github.event_name == 'pull_request'
+        env:
+          MATRIX_LANGUAGE: ${{ matrix.language }}
+        run: |
+          python3 <<'PYEOF'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          lang = os.environ["MATRIX_LANGUAGE"]
+
+          # Fingerprint = "<rule-id>:<partial-fingerprint-hash>".
+          # CodeQL emits SARIF partialFingerprints.primaryLocationLineHash
+          # (a hash of the location's surrounding snippet, line-shift-stable).
+          # Falling back to "rule:file:line" only for runs where partial
+          # fingerprints are missing — rare on modern CodeQL.
+          def fingerprint(result):
+              rule = result.get("ruleId", "?")
+              pf = result.get("partialFingerprints", {})
+              h = pf.get("primaryLocationLineHash")
+              if h:
+                  return f"{rule}:{h}"
+              for loc in result.get("locations", []):
+                  phys = loc.get("physicalLocation", {})
+                  path = phys.get("artifactLocation", {}).get("uri", "?")
+                  line = phys.get("region", {}).get("startLine", "?")
+                  return f"{rule}:{path}:{line}"
+              return f"{rule}:?"
+
+          # 1. Load baseline (union of legacy line-based and new partial-
+          # fingerprint formats — both are accepted while the baseline
+          # transitions from one to the other).
+          with open("/tmp/security-baseline.json") as f:
+              baseline = json.load(f)
+          known = set(baseline.get("codeql", {}).get("fingerprints", []))
+
+          # 2. Locate SARIF outputs
+          sarif_dir = Path("./codeql-results")
+          sarif_files = sorted(sarif_dir.glob("*.sarif"))
+          if not sarif_files:
+              print(f"::warning::No SARIF produced for {lang}; skipping ratchet")
+              sys.exit(0)
+
+          # 3. Extract fingerprints from current scan. Also keep a parallel
+          # location map so we can annotate new findings with file/line.
+          current = set()
+          locations = {}  # fingerprint -> (path, line)
+          for sf in sarif_files:
+              with open(sf) as f:
+                  doc = json.load(f)
+              for run in doc.get("runs", []):
+                  for result in run.get("results", []):
+                      fp = fingerprint(result)
+                      current.add(fp)
+                      for loc in result.get("locations", []):
+                          phys = loc.get("physicalLocation", {})
+                          path = phys.get("artifactLocation", {}).get("uri", "?")
+                          line = phys.get("region", {}).get("startLine", "?")
+                          locations[fp] = (path, line)
+                          break
+
+          # 4. Diff
+          new_findings = current - known
+          resolved = known - current
+
+          print(f"::notice::Language: {lang}")
+          print(f"::notice::Baseline known fingerprints: {len(known)}")
+          print(f"::notice::Current scan fingerprints:  {len(current)}")
+          print(f"::notice::New (this PR):              {len(new_findings)}")
+          print(f"::notice::Resolved/moved:             {len(resolved)}")
+
+          if new_findings:
+              print()
+              print("New CodeQL findings introduced by this change:")
+              for fp in sorted(new_findings):
+                  path, line = locations.get(fp, ("?", "?"))
+                  rule = fp.split(":", 1)[0]
+                  print(f"  - [{rule}] {path}:{line}  (fp={fp})")
+                  print(
+                      f"::error file={path},line={line}::"
+                      f"[{rule}] New CodeQL finding (not in baseline)"
+                  )
+              print()
+              print(
+                  f"::error::This PR introduces {len(new_findings)} new "
+                  f"CodeQL finding(s) for {lang} beyond the security "
+                  f"baseline. Either fix the finding(s) or, if intentional, "
+                  f"have a maintainer update .github/security-baseline.json "
+                  f"on the security-baseline branch."
+              )
+              sys.exit(1)
+
+          print()
+          print("Ratchet PASS: no new findings beyond baseline.")
+          PYEOF
+
+  update-baseline:
+    name: Update baseline on push to main
+    needs: analyze
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - name: Checkout security-baseline
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: security-baseline
+          fetch-depth: 1
+
+      - name: Download Python SARIF
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: codeql-sarif-python
+          path: ./sarif-python
+
+      - name: Download JavaScript SARIF
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: codeql-sarif-javascript
+          path: ./sarif-javascript
+
+      - name: Rebuild baseline from current SARIF
+        run: |
+          python3 <<'PYEOF'
+          import json
+          from datetime import date
+          from pathlib import Path
+
+          # Same fingerprint strategy as the PR-side Ratchet step:
+          # prefer SARIF partialFingerprints.primaryLocationLineHash
+          # (line-shift-stable), fall back to rule:file:line only when
+          # missing.
+          def fingerprint(result):
+              rule = result.get("ruleId", "?")
+              pf = result.get("partialFingerprints", {})
+              h = pf.get("primaryLocationLineHash")
+              if h:
+                  return f"{rule}:{h}"
+              for loc in result.get("locations", []):
+                  phys = loc.get("physicalLocation", {})
+                  path = phys.get("artifactLocation", {}).get("uri", "?")
+                  line = phys.get("region", {}).get("startLine", "?")
+                  return f"{rule}:{path}:{line}"
+              return f"{rule}:?"
+
+          fps = set()
+          for sf in list(Path("./sarif-python").rglob("*.sarif")) + \
+                   list(Path("./sarif-javascript").rglob("*.sarif")):
+              with open(sf) as f:
+                  doc = json.load(f)
+              for run in doc.get("runs", []):
+                  for result in run.get("results", []):
+                      fps.add(fingerprint(result))
+
+          out = {
+              "schema_version": 2,
+              "updated": date.today().isoformat(),
+              "description": (
+                  "Known-finding fingerprints from main. PR scans compare "
+                  "to this snapshot; new fingerprints fail the ratchet "
+                  "job. Format: <rule-id>:<SARIF-partialFingerprint> "
+                  "(line-shift-stable). Maintained by the codeql "
+                  "update-baseline job on push to main; manual pushes are "
+                  "reverted by baseline-guard.yml."
+              ),
+              "codeql": {
+                  "count": len(fps),
+                  "fingerprints": sorted(fps),
+              },
+          }
+          with open(".github/security-baseline.json", "w") as f:
+              json.dump(out, f, indent=2)
+              f.write("\n")
+          PYEOF
+
+      - name: Commit and push if changed
+        env:
+          GH_COMMIT_AUTHOR: github-actions[bot]
+          GH_COMMIT_EMAIL: github-actions[bot]@users.noreply.github.com
+          # Pass head-commit message through env, NEVER interpolate it
+          # directly into the shell script. The squash-merge body can
+          # contain arbitrary text (CSS snippets, backticks, `$(...)`,
+          # quotes); direct ${{ }} expansion would tokenise it as shell
+          # commands — broken job AND a classic Actions script-injection
+          # vector. Read it as $HEAD_COMMIT_SUBJECT below instead.
+          HEAD_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          if git diff --quiet .github/security-baseline.json; then
+            echo "Baseline unchanged; nothing to push."
+            exit 0
+          fi
+          git config user.name "$GH_COMMIT_AUTHOR"
+          git config user.email "$GH_COMMIT_EMAIL"
+          git add .github/security-baseline.json
+          # Take only the subject (first line) of the triggering commit
+          # so the trailer stays one line and never re-introduces multi-
+          # paragraph bodies into this commit message.
+          head_subject="${HEAD_COMMIT_MESSAGE%%$'\n'*}"
+          git commit -m "chore(baseline): refresh from main @ ${GITHUB_SHA::7}" \
+                     -m "Auto-updated by codeql.yml update-baseline job after the merge of: ${head_subject}"
+          git push origin HEAD:security-baseline
