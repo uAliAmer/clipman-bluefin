@@ -40,11 +40,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: main
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
 
@@ -75,13 +75,15 @@ jobs:
           gnome = get_json(f"https://extensions.gnome.org/extension-info/?pk={GNOME_EXTENSION_ID}")
 
           # Preserve prior values on partial failure so a transient outage
-          # never wipes the JSON down to zeros.
+          # never wipes the JSON down to zeros. updated_at is carried over
+          # unchanged here and only bumped below when a counter actually
+          # moved: setting it to now() on every run made the file always
+          # differ, so each run opened a no-op PR — and merging one
+          # re-triggered this workflow via the push path filter, chaining
+          # junk PRs.
           new = {
               "_comment": prev.get("_comment"),
-              "updated_at": datetime.datetime.now(tz=datetime.timezone.utc)
-                              .replace(microsecond=0)
-                              .isoformat()
-                              .replace("+00:00", "Z"),
+              "updated_at": prev.get("updated_at"),
               "pypi": dict(prev.get("pypi", {})),
               "gnome": dict(prev.get("gnome", {})),
           }
@@ -101,6 +103,15 @@ jobs:
                   "downloads": int(gnome["downloads"]),
                   "source": f"https://extensions.gnome.org/extension-info/?pk={GNOME_EXTENSION_ID}",
               })
+
+          # Stamp a fresh timestamp only when a counter changed. If the
+          # fetched data matches what's already committed, the file stays
+          # byte-identical and ``git diff --quiet`` below skips the PR.
+          if new["pypi"] != prev.get("pypi", {}) or new["gnome"] != prev.get("gnome", {}):
+              new["updated_at"] = (datetime.datetime.now(tz=datetime.timezone.utc)
+                                   .replace(microsecond=0)
+                                   .isoformat()
+                                   .replace("+00:00", "Z"))
 
           with open(NUMBERS_PATH, "w") as f:
               json.dump(new, f, indent=2)
@@ -127,7 +138,15 @@ jobs:
           # maintainer approves only the latest pending PR. If they miss a
           # day, stale auto-refresh PRs would otherwise pile up — close each
           # prior one (and delete its branch) before opening today's.
-          mapfile -t stale < <(gh pr list --state open --search "chore(numbers) in:title" --json number --jq ".[].number") || stale=()
+          #
+          # NB: filter client-side, not with ``--search``. gh pr list
+          # --search hits the code-search index, which is eventually
+          # consistent and returned nothing under GITHUB_TOKEN in this
+          # runner, so no PR was ever closed and refreshes piled up. The
+          # plain REST list (--json) is immediately consistent; match the
+          # title prefix with jq instead.
+          mapfile -t stale < <(gh pr list --state open --limit 100 --json number,title \
+            --jq '.[] | select(.title | startswith("chore(numbers)")) | .number') || stale=()
           for n in "${stale[@]:-}"; do
             [ -n "$n" ] && gh pr close "$n" --delete-branch --comment "Superseded by a newer daily numbers refresh ($(date -u +%F)). Approve the most recent chore(numbers) PR instead." || true
           done

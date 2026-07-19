@@ -1,8 +1,32 @@
 __pycache__/
-*.py[cod]
-*.disabled
-*.log
-.ydotool_socket
-# user clipboard DB lives in ~/.local/share/clipman/, never here — belt & braces:
-clipman.db*
-data/clipman.db*
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Data (runtime)
+*.sqlite
+*.db
+
+# Environment
+.env
+.venv/
+clipman-extension.zip
+
+# Media
+Demo.webm
+
+# Snap build artifacts
+*.snap
+snapcraft-clipman-*.txt
+parts/
+prime/
+stage/

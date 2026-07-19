@@ -1,6 +1,6 @@
 > **⚙️ Personal fork** — patched for **Bluefin-DX / Fedora atomic, GNOME 50, Wayland**.
-> Auto-paste rewired from broken `wtype` to `ydotool` keycodes. See
-> [`CUSTOMIZATIONS.md`](CUSTOMIZATIONS.md) for the patches and
+> Tracks upstream v1.2.0 (native paste via the GNOME Shell extension). See
+> [`CUSTOMIZATIONS.md`](CUSTOMIZATIONS.md) for the atomic-host deltas and
 > [`INSTALL-BLUEFIN.md`](INSTALL-BLUEFIN.md) for setup. Upstream:
 > [MohammedEl-sayedAhmed/clipman](https://github.com/MohammedEl-sayedAhmed/clipman) (Apache-2.0).
 
@@ -43,7 +43,7 @@ Press **Super+V** to view your clipboard history, search entries, pin favorites,
 
 <br>
 
-<sub><i>Above: the shipped GTK 4 + libadwaita popup. The full settings surface is an <code>Adw.PreferencesWindow</code>, the snippets editor is an <code>Adw.NavigationSplitView</code> dialog, and the 16 edge states (empty, no-results, incognito, sensitive-cleared, first-run, errors…) render as Adwaita <code>StatusPage</code> / <code>Banner</code> / <code>AlertDialog</code> with a shared Catppuccin overlay. <a href="https://mohammedel-sayedahmed.github.io/clipman/#design">Browse the mockups</a> · <a href="https://mohammedel-sayedahmed.github.io/clipman/">project page</a>.</i></sub>
+<sub><i>Above: the shipped GTK 4 + libadwaita popup. The full settings surface is a sidebar <code>Adw.Dialog</code>, the snippets editor is an <code>Adw.NavigationSplitView</code> dialog, and the 19 edge states (empty, no-results, incognito, sensitive-cleared, first-run, errors…) render as Adwaita <code>StatusPage</code> / <code>Banner</code> / <code>AlertDialog</code> with a shared Catppuccin overlay. <a href="https://mohammedel-sayedahmed.github.io/clipman/#design">Browse the mockups</a> · <a href="https://mohammedel-sayedahmed.github.io/clipman/">project page</a>.</i></sub>
 
 </div>
 

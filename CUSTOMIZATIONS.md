@@ -1,45 +1,34 @@
 # Customizations (fork of MohammedEl-sayedAhmed/clipman)
 
 Personal fork of [clipman](https://github.com/MohammedEl-sayedAhmed/clipman) (Apache-2.0)
-patched to run on **Bluefin-DX (Fedora atomic), GNOME Shell 50, Wayland**.
-Upstream targets GNOME 45–48 and assumes `wtype` works — neither holds here.
+running on **Bluefin-DX (Fedora atomic), GNOME Shell 50, Wayland**.
 
-## Why these patches
+Tracks **upstream v1.2.0**. As of 1.2 upstream paste is **native**: the GNOME
+Shell extension restores focus (`RestorePreviousFocus`) and injects the
+keystroke with a Clutter virtual device (`SimulatePaste`) — inside the
+compositor, so it works where `wtype` cannot. This makes the old fork
+`window.py` ydotool/keycode hacks unnecessary; they were dropped when merging
+1.2. `wtype`/`ydotool` remain only as a fallback for non-GNOME compositors.
 
-### 1. `wtype` is dead on GNOME/Mutter Wayland
-`wtype` needs the `zwp_virtual_keyboard_manager_v1` protocol, which Mutter
-refuses for security. Every `wtype` call returns:
+## Remaining fork deltas
 
-```
-Compositor does not support the virtual keyboard protocol   (exit 1)
-```
+These are **not** committed code edits — `install-bluefin.sh` applies them at
+deploy time so the working tree stays clean against upstream:
 
-So auto-paste never fired. Upstream's paste loop treated "process ran" as
-success and short-circuited on `wtype`, never reaching the `ydotool` fallback.
-
-### 2. `ydotool key` takes keycodes, not names
-ydotool 1.0.4's `key` subcommand wants raw `<keycode>:<pressed>` pairs.
-Upstream passed `ydotool key ctrl+v` — a non-interpretable arg that ydotool
-silently turns into a delay (exit 0, **emits nothing**). Looked like success,
-pasted nothing.
-
-## Patches (`clipman/window.py`)
-
-| Change | From | To |
+| Delta | What | Why |
 |---|---|---|
-| `_PASTE_COMMANDS` ydotool ctrl-v | `["ydotool","key","ctrl+v"]` | `["ydotool","key","29:1","47:1","47:0","29:0"]` |
-| ydotool ctrl-shift-v | `ctrl+shift+v` | `29:1 42:1 47:1 47:0 42:0 29:0` |
-| ydotool shift-insert | `shift+Insert` | `42:1 110:1 110:0 42:0` |
-| `_simulate_paste` loop | return on any run | return only on `rc == 0`, else fall through to next backend |
-| paste delay (`_paste_entry`, `_paste_snippet`) | `80` ms | `150` ms (focus-return settle on Mutter) |
+| `extension/metadata.json` `shell-version` | `45–48` → `45–50` | Bluefin is GNOME 50; extension API surface (D-Bus + `Meta.Selection`) survives the jump |
+| `install.sh` dep step | `sudo dnf/apt install …` neutralized | atomic host — deps ship in the image, no `rpm-ostree` layering |
 
-Keycodes: ctrl=29, shift=42, v=47, Insert=110.
+## Fork-only files
 
-## Patch (`extension/metadata.json`)
-`shell-version` extended `45–48` → `45–50`. The shell extension only does
-`Meta.Selection` signal detection, so the small API surface survives the
-45→50 jump; the GTK4 daemon is shell-version-independent.
+- `install-bluefin.sh` — idempotent atomic-host installer (runtime-patches the
+  two deltas above, disables autostart dup, sets up fallback backend).
+- `INSTALL-BLUEFIN.md` — setup + verification.
+- This file.
 
-## Runtime requirement (not code)
-Auto-paste needs **ydotoold running** + the user in the **`input` group**
-(for `/dev/uinput`). See `INSTALL-BLUEFIN.md`.
+## Runtime note (fallback only)
+
+The `ydotool` fallback path still needs **ydotoold running** + user in the
+**`input` group** (`/dev/uinput`). On GNOME 50 the native extension path is
+primary, so this is belt-and-suspenders. See `INSTALL-BLUEFIN.md`.

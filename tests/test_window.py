@@ -18,7 +18,7 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 # Force off-screen behaviour so the test runner doesn't need a real
 # display server. Adw still needs to initialise but it's happy to do
@@ -67,14 +67,15 @@ if os.environ.get("CLIPMAN_REQUIRE_GTK4") == "1" and not (_HAS_GTK and _ADW_INIT
 @unittest.skipUnless(_HAS_GTK and _ADW_INIT_OK,
                      "GTK 4 + libadwaita not available")
 class TestEdgeStates(unittest.TestCase):
-    """The 16 mockup states must all map to a renderable widget."""
+    """Every declared state must map to a renderable widget."""
 
     EXPECTED_IDS = {
         "populated", "empty", "no-snippets-yet", "no-results", "first-run",
         "incognito-on", "sensitive-shown", "sensitive-cleared",
         "extension-missing", "backup-failed", "restore-failed",
         "network-error", "db-locked", "paused", "paste-target-missing",
-        "history-too-large",
+        "history-too-large", "clipboard-blocked", "watcher-crashed",
+        "shortcut-failed",
     }
 
     def test_state_id_inventory(self):
@@ -86,7 +87,7 @@ class TestEdgeStates(unittest.TestCase):
         """
         from clipman.edge_states import STATES
         self.assertEqual(set(STATES.keys()), self.EXPECTED_IDS)
-        self.assertEqual(len(STATES), 16)
+        self.assertEqual(len(STATES), 19)
 
     def test_render_each_state_returns_widget(self):
         from clipman.edge_states import STATES, render_edge_state
@@ -103,7 +104,9 @@ class TestEdgeStates(unittest.TestCase):
                 # on the resulting type to decide where to mount it.
                 spec = widget.state_spec
                 if spec.kind == "banner":
-                    self.assertIsInstance(widget, Adw.Banner)
+                    # Custom banner row (icon · title/desc · action · X) —
+                    # Adw.Banner can't show a desc line or dismiss button.
+                    self.assertTrue(widget.has_css_class("edge-banner"))
                 elif spec.kind == "alertdialog":
                     self.assertIsInstance(widget, Adw.AlertDialog)
                 else:
@@ -222,6 +225,54 @@ class TestWindowConstruction(unittest.TestCase):
         self.assertTrue(hasattr(window, "refresh"))
         self.assertTrue(hasattr(window, "refresh_update_banner"))
 
+    def test_incognito_toggle_syncs_monitor_button_and_pill(self):
+        """set_incognito drives the monitor, header button and footer pill.
+
+        The bulky in-list "incognito-on" banner was replaced by the footer
+        status pill (Recording/Paused). set_incognito is also the launch-time
+        entry point for the incognito_on_launch setting.
+        """
+        from unittest.mock import MagicMock
+
+        from clipman.window import ClipmanWindow
+
+        db = self._make_db()
+        app = Adw.Application(application_id="com.clipman.TestIncognito")
+        monitor = MagicMock()
+        window = ClipmanWindow(application=app, db=db, monitor=monitor)
+
+        window.set_incognito(True)
+        self.assertTrue(window._incognito_btn.get_active())
+        monitor.set_incognito.assert_called_with(True)
+        self.assertEqual(window._recording_label.get_text(), "Paused")
+        self.assertTrue(window._recording_pill.has_css_class("paused"))
+
+        window.set_incognito(False)
+        self.assertFalse(window._incognito_btn.get_active())
+        monitor.set_incognito.assert_called_with(False)
+        self.assertEqual(window._recording_label.get_text(), "Recording")
+        self.assertFalse(window._recording_pill.has_css_class("paused"))
+
+    def test_incognito_header_toggle_persists(self):
+        """The header incognito toggle persists across restarts.
+
+        Regression: only the Privacy switch persisted incognito, so a
+        daemon restart silently re-enabled incognito the user had turned
+        off in the header — copies were dropped with no visible cause.
+        """
+        from unittest.mock import MagicMock
+
+        from clipman.window import ClipmanWindow
+
+        db = self._make_db()
+        app = Adw.Application(application_id="com.clipman.TestIncogPersist")
+        window = ClipmanWindow(application=app, db=db, monitor=MagicMock())
+
+        window._incognito_btn.set_active(True)
+        self.assertEqual(db.get_setting("incognito_on_launch"), "true")
+        window._incognito_btn.set_active(False)
+        self.assertEqual(db.get_setting("incognito_on_launch"), "false")
+
     def test_preferences_window_constructs(self):
         from clipman.preferences import ClipmanPreferences
         from clipman.window import ClipmanWindow
@@ -232,6 +283,271 @@ class TestWindowConstruction(unittest.TestCase):
         prefs = ClipmanPreferences(db, parent, on_setting_changed=None)
         self.assertIsNotNone(prefs)
 
+    def test_catppuccin_palette_is_optional(self):
+        """use_catppuccin gates whether the forced @-token palette is applied
+        (off = follow the system GNOME theme/accent)."""
+        from clipman.window import ClipmanWindow
+
+        db = self._make_db()
+        app = Adw.Application(application_id="com.clipman.TestCatppuccin")
+
+        w_on = ClipmanWindow(application=app, db=db, monitor=None)
+        self.assertTrue(w_on._use_catppuccin)  # default on
+        self.assertIn("@define-color", w_on._catppuccin_palette_block())
+
+        db.set_setting("use_catppuccin", "false")
+        w_off = ClipmanWindow(application=app, db=db, monitor=None)
+        self.assertFalse(w_off._use_catppuccin)
+        # hot-reload back on without raising
+        w_off._on_setting_changed("use_catppuccin", "true")
+        self.assertTrue(w_off._use_catppuccin)
+
+    def test_type_icons_resolve(self):
+        """Every row type icon must exist so no broken-icon placeholder shows."""
+        from gi.repository import Gdk, Gtk
+
+        from clipman.window import ROW_TYPE_ICONS
+
+        theme = Gtk.IconTheme.get_for_display(Gdk.Display.get_default())
+        for name in ROW_TYPE_ICONS.values():
+            self.assertTrue(theme.has_icon(name), name)
+    def test_preferences_is_in_surface_dialog(self):
+        """Preferences must be an Adw.Dialog (in-surface), not a top-level.
+
+        Regression guard: as a top-level Adw.PreferencesWindow it opened
+        behind the popup on Wayland and looked unresponsive.
+        """
+        from gi.repository import Gtk
+
+        from clipman.preferences import ClipmanPreferences
+
+        db = self._make_db()
+        prefs = ClipmanPreferences(db, None, on_setting_changed=None)
+        self.assertIsInstance(prefs, Adw.Dialog)
+        self.assertNotIsInstance(prefs, Gtk.Window)
+
+    def test_dismiss_on_focus_loss(self):
+        """notify::is-active handler hides the popup when it loses focus,
+        unless an in-app child dialog is open (Win+V click-outside dismiss)."""
+        from clipman.window import ClipmanWindow
+
+        db = self._make_db()
+        app = Adw.Application(application_id="com.clipman.TestDismiss")
+        window = ClipmanWindow(application=app, db=db, monitor=None)
+        # Headless: the window is never compositor-active, so is-active is
+        # False — exactly the "lost focus" condition.
+        self.assertFalse(window.get_property("is-active"))
+
+        window.set_visible(True)
+        window._child_dialog = None
+        window._on_active_changed()
+        self.assertFalse(window.get_visible())  # dismissed on focus loss
+
+        # A mapped child dialog suppresses the dismiss.
+        window.set_visible(True)
+        child = MagicMock()
+        child.get_mapped.return_value = True
+        window._child_dialog = child
+        window._on_active_changed()
+        self.assertTrue(window.get_visible())  # child open -> stay put
+
+    def test_hide_cancels_timer_and_closes_child(self):
+        """_hide() must reset the cursor timer and force-close any child so
+        the dismiss guard can't latch (hiding never fires a dialog 'closed')."""
+        from clipman.window import ClipmanWindow
+
+        db = self._make_db()
+        app = Adw.Application(application_id="com.clipman.TestHide")
+        window = ClipmanWindow(application=app, db=db, monitor=None)
+        window.set_visible(True)
+        window._cursor_move_id = 0
+        child = MagicMock()
+        child.get_mapped.return_value = True
+        window._child_dialog = child
+        window._hide()
+        self.assertFalse(window.get_visible())
+        self.assertIsNone(window._child_dialog)     # ref cleared (no latch)
+        child.force_close.assert_called_once()      # stale dialog closed
+        self.assertFalse(window._child_is_open())
+
+    def test_move_to_cursor_guarded_when_hidden(self):
+        """A stale _move_to_cursor timer must not re-activate a hidden popup."""
+        from clipman.window import ClipmanWindow
+
+        db = self._make_db()
+        app = Adw.Application(application_id="com.clipman.TestCursor")
+        window = ClipmanWindow(application=app, db=db, monitor=None)
+        window.set_visible(False)
+        # Returns False (removes source) and no-ops because it's hidden.
+        self.assertFalse(window._move_to_cursor())
+        self.assertEqual(window._cursor_move_id, 0)
+
+    def test_paste_prefers_shell_injection(self):
+        """On GNOME the Shell injects the keystroke (wtype can't on Mutter),
+        so _dispatch_paste routes through the extension and must NOT also
+        fire the wtype fallback when the Shell path succeeds."""
+        from clipman.window import ClipmanWindow
+
+        db = self._make_db()
+        app = Adw.Application(application_id="com.clipman.TestPasteShell")
+        window = ClipmanWindow(application=app, db=db, monitor=None)
+        window._paste_via_shell = lambda mode: True  # extension present
+
+        with patch("clipman.window.GLib.timeout_add") as timeout_add:
+            window._dispatch_paste()
+
+        self.assertFalse(timeout_add.called)  # no wtype fallback scheduled
+
+    def test_paste_falls_back_to_wtype_without_shell(self):
+        """With no extension reachable, _dispatch_paste falls back to the
+        wtype/ydotool keystroke (works on non-GNOME compositors)."""
+        from clipman.window import ClipmanWindow
+
+        db = self._make_db()
+        app = Adw.Application(application_id="com.clipman.TestPasteWtype")
+        window = ClipmanWindow(application=app, db=db, monitor=None)
+        window._paste_via_shell = lambda mode: False  # no extension
+
+        with patch("clipman.window.GLib.timeout_add") as timeout_add:
+            window._dispatch_paste()
+
+        self.assertTrue(timeout_add.called)
+        _delay, callback = timeout_add.call_args[0][:2]
+        self.assertEqual(callback, window._simulate_paste)
+
+    def test_paste_via_shell_restores_focus_then_injects(self):
+        """The Shell path must restore focus FIRST, then inject the keystroke
+        (deferred so focus can settle) — order matters or Ctrl+V misses."""
+        from clipman.window import ClipmanWindow
+
+        db = self._make_db()
+        app = Adw.Application(application_id="com.clipman.TestPasteOrder")
+        window = ClipmanWindow(application=app, db=db, monitor=None)
+        calls = []
+        fake_iface = MagicMock()
+        fake_iface.RestorePreviousFocus.side_effect = (
+            lambda: calls.append("focus")
+        )
+        fake_iface.SimulatePaste.side_effect = (
+            lambda m: calls.append(("paste", m))
+        )
+        window._shell_extension_iface = lambda: fake_iface
+
+        with patch("clipman.window.GLib.timeout_add") as timeout_add:
+            result = window._paste_via_shell("auto")
+
+        self.assertTrue(result)
+        self.assertEqual(calls, ["focus"])  # focus restored synchronously
+        # The keystroke is deferred via a timer; firing it injects via Shell.
+        self.assertTrue(timeout_add.called)
+        _delay, callback = timeout_add.call_args[0][:2]
+        callback()
+        self.assertEqual(calls, ["focus", ("paste", "auto")])
+
+    def test_paste_via_shell_returns_false_without_extension(self):
+        """No extension -> _paste_via_shell reports failure (so paste can
+        fall back to wtype) and never raises."""
+        from clipman.window import ClipmanWindow
+
+        db = self._make_db()
+        app = Adw.Application(application_id="com.clipman.TestNoExt")
+        window = ClipmanWindow(application=app, db=db, monitor=None)
+        window._shell_extension_iface = lambda: None
+        self.assertFalse(window._paste_via_shell("auto"))
+
+    def test_classify_text_code_vs_prose(self):
+        """The row-type classifier catches obvious code without flagging
+        prose. Regression: print('...{0}...'.format(x)) showed as plain
+        text; earlier, 'cd cabinet' showed as code."""
+        from clipman.window import _classify_text
+
+        fmt_call = "print('The sum of {0} and {1} is {2}'" \
+            + ".format(num1, num2, sum))"
+        code = [
+            fmt_call,
+            "def hello():",
+            "x => x * 2",
+            "result.append(42)",
+            "git log --oneline {",
+        ]
+        prose = [
+            "cd cabinet",
+            "from the shop earlier",
+            "meet me at 5pm (maybe)",
+            "The quick brown fox jumps over the lazy dog.",
+        ]
+        for t in code:
+            self.assertEqual(_classify_text(t), "code", t)
+        for t in prose:
+            self.assertEqual(_classify_text(t), "text", t)
+        self.assertEqual(_classify_text("https://github.com/x/y"), "link")
+
+    def test_copy_prefers_wl_copy_on_wayland(self):
+        """On Wayland the background daemon must set the clipboard via wl-copy
+        — Gdk.Clipboard.set() silently fails without input focus, so the
+        stale clipboard would get pasted instead of the chosen entry."""
+        from clipman.window import ClipmanWindow
+
+        db = self._make_db()
+        app = Adw.Application(application_id="com.clipman.TestCopyWayland")
+        window = ClipmanWindow(application=app, db=db, monitor=None)
+        calls = []
+        window._is_wayland = lambda: True
+        window._wl_copy = lambda data, mime=None: (
+            calls.append((data, mime)) or True
+        )
+
+        window._copy_to_clipboard("hello world")
+
+        self.assertEqual(calls, [(b"hello world", None)])
+
+    def test_copy_uses_gtk_off_wayland(self):
+        """Off Wayland (X11) selections don't need focus, so the daemon uses
+        GTK's clipboard and must not shell out to wl-copy."""
+        from clipman.window import ClipmanWindow
+
+        db = self._make_db()
+        app = Adw.Application(application_id="com.clipman.TestCopyX11")
+        window = ClipmanWindow(application=app, db=db, monitor=None)
+        wl_called = []
+        window._is_wayland = lambda: False
+        window._wl_copy = lambda data, mime=None: wl_called.append(1) or True
+
+        window._copy_to_clipboard("x")  # GTK path; no wl-copy on X11
+
+        self.assertEqual(wl_called, [])
+
+    def test_backup_restore_use_toplevel_parent(self):
+        """FileChooserNative needs a Gtk.Window parent; the dialog isn't one.
+
+        Regression guard for the PreferencesWindow->PreferencesDialog port
+        that crashed Export/Restore with a TypeError.
+        """
+        from gi.repository import Gtk
+
+        from clipman.preferences import ClipmanPreferences
+        from clipman.window import ClipmanWindow
+
+        db = self._make_db()
+        app = Adw.Application(application_id="com.clipman.TestBackup")
+        parent = ClipmanWindow(application=app, db=db, monitor=None)
+        prefs = ClipmanPreferences(db, parent, on_setting_changed=None)
+        self.assertIsInstance(prefs._parent_window, Gtk.Window)
+        # The parent must be accepted by FileChooserNative (no TypeError).
+        chooser = Gtk.FileChooserNative.new(
+            "t", prefs._parent_window, Gtk.FileChooserAction.SAVE, "s", "c"
+        )
+        self.assertIsNotNone(chooser)
+
+    def test_window_is_not_resizable(self):
+        """Win+V parity: the popup is a fixed panel, not a resizable window."""
+        from clipman.window import ClipmanWindow
+
+        db = self._make_db()
+        app = Adw.Application(application_id="com.clipman.TestResize")
+        window = ClipmanWindow(application=app, db=db, monitor=None)
+        self.assertFalse(window.get_resizable())
+
     def test_snippets_dialog_constructs(self):
         from clipman.snippets_dialog import SnippetsDialog
 
@@ -239,14 +555,60 @@ class TestWindowConstruction(unittest.TestCase):
         dialog = SnippetsDialog(db)
         self.assertIsNotNone(dialog)
 
+    def test_new_snippet_loads_into_editor_form(self):
+        """Creating a new snippet must populate the editor, not blank it.
+
+        Regression: _on_new_clicked used to set self._selected_id
+        BEFORE _reload_list(), so when the reload re-selected the row,
+        _on_row_selected early-returned (snippet_id == _selected_id) and
+        _load_into_form never ran — the form stayed blank. Assert the
+        selection AND the observable form state (name entry + content
+        buffer + title) reflect the freshly created snippet.
+        """
+        from clipman.snippets_dialog import SnippetsDialog
+
+        db = self._make_db()
+        dialog = SnippetsDialog(db)
+
+        # Sanity: nothing selected, form blank before the new action.
+        self.assertIsNone(dialog._selected_id)
+        self.assertEqual(dialog._name_row.get_text(), "")
+
+        dialog._on_new_clicked(None)
+
+        # The new row's id is now the selection target.
+        self.assertIsNotNone(dialog._selected_id)
+        new_id = dialog._selected_id
+
+        # The DB persisted exactly the snippet we expect.
+        snippet = next(
+            (s for s in db.get_snippets() if s["id"] == new_id), None
+        )
+        self.assertIsNotNone(snippet)
+
+        # Observable editor state must mirror the new snippet, not be blank.
+        self.assertEqual(dialog._name_row.get_text(), snippet["name"])
+        buf = dialog._textview.get_buffer()
+        buffer_text = buf.get_text(
+            buf.get_start_iter(), buf.get_end_iter(), True
+        )
+        self.assertEqual(buffer_text, snippet.get("content_text") or "")
+        self.assertEqual(dialog._title_label.get_text(), snippet["name"])
+        self.assertTrue(dialog._delete_btn.get_sensitive())
+
+        # And the sidebar row for the new snippet is the selected one.
+        selected = dialog._listbox.get_selected_row()
+        self.assertIsNotNone(selected)
+        self.assertEqual(getattr(selected, "snippet_id", None), new_id)
+
     def test_refresh_with_seeded_entries(self):
-        """Three seeded entries -> three ActionRows with their titles."""
+        """Three seeded entries -> three model items, newest first."""
         from clipman.window import ClipmanWindow
 
         db = self._make_db()
         # Seed in reverse chronological order — get_entries returns most
         # recent first, so we insert "old" then "mid" then "new" and
-        # expect the listbox to show them in (new, mid, old) order.
+        # expect the model to hold them in (new, mid, old) order.
         for text in ("old entry", "mid entry", "new entry"):
             db.add_entry("text", content_text=text)
 
@@ -254,22 +616,12 @@ class TestWindowConstruction(unittest.TestCase):
         window = ClipmanWindow(application=app, db=db, monitor=None)
         window.refresh()
 
-        # The listbox should now contain three Adw.ActionRow widgets.
-        rows = []
-        i = 0
-        while True:
-            row = window.listbox.get_row_at_index(i)
-            if row is None:
-                break
-            rows.append(row)
-            i += 1
-        self.assertEqual(len(rows), 3)
-
-        titles = [r.get_title() for r in rows]
-        # Order: get_entries returns most-recent first.
-        self.assertEqual(titles[0], "new entry")
-        self.assertEqual(titles[1], "mid entry")
-        self.assertEqual(titles[2], "old entry")
+        # The virtualized model should now hold three ClipItems.
+        store = window._store
+        self.assertEqual(store.get_n_items(), 3)
+        texts = [store.get_item(i).data["content_text"] for i in range(3)]
+        # get_entries returns most-recent first.
+        self.assertEqual(texts, ["new entry", "mid entry", "old entry"])
 
     def test_on_setting_changed_fan_out(self):
         """ClipmanPreferences._save fans out (key, value) to the callback."""
@@ -294,6 +646,22 @@ class TestWindowConstruction(unittest.TestCase):
         self.assertIn(("font_size", 14), received)
         # And the value persisted to the DB as a stringified int.
         self.assertEqual(db.get_setting("font_size"), "14")
+
+    def test_save_stores_bools_lowercase(self):
+        """_save persists Python bools as lowercase 'true'/'false'.
+
+        Regression: str(True) == 'True', which broke case-sensitive readers
+        like app.py's `incognito_on_launch == 'true'` — the Privacy toggle
+        silently did nothing.
+        """
+        from clipman.preferences import ClipmanPreferences
+
+        db = self._make_db()
+        prefs = ClipmanPreferences(db, None, on_setting_changed=None)
+        prefs._save("incognito_on_launch", True)
+        self.assertEqual(db.get_setting("incognito_on_launch"), "true")
+        prefs._save("incognito_on_launch", False)
+        self.assertEqual(db.get_setting("incognito_on_launch"), "false")
 
     def test_refresh_update_banner_revealed(self):
         """should_show_banner -> (True, version) reveals the banner."""
@@ -343,7 +711,9 @@ class TestWindowConstruction(unittest.TestCase):
         # actually called something rather than the warning fallback.
         called: list[str] = []
         window._open_url = lambda url: called.append(("url", url))
-        window._on_prefs_clicked = lambda _b: called.append(("prefs", None))
+        window._on_prefs_clicked = (
+            lambda _b, page=None: called.append(("prefs", page))
+        )
         window._on_snippets_clicked = lambda _b: called.append(
             ("snippets", None)
         )
@@ -376,6 +746,271 @@ class TestWindowConstruction(unittest.TestCase):
         self.assertIn(
             "definitely-not-an-action", warning_messages[0]
         )
+
+    def test_thumbnail_texture_decodes_at_scale_not_full_res(self):
+        """A large stored image yields a bounded-size thumbnail texture.
+
+        Regression for the perf bug where the image-row thumbnail decoded
+        the FULL-resolution stored screenshot into a GPU texture on every
+        history refresh, then shrank it. The fix decodes-and-scales at
+        load, so the resulting texture must be far smaller than the
+        1600x1200 source — bounded by the requested oversampled box, not
+        the source dimensions.
+        """
+        from gi.repository import GdkPixbuf
+
+        from clipman.window import ClipmanWindow
+
+        # Build a real 1600x1200 PNG in memory (no alpha needed).
+        big = GdkPixbuf.Pixbuf.new(
+            GdkPixbuf.Colorspace.RGB, False, 8, 1600, 1200
+        )
+        big.fill(0x3366FFFF)  # solid blue; RGBA packed
+        ok, png_bytes = big.save_to_bufferv("png", [], [])
+        self.assertTrue(ok, "failed to encode source PNG")
+
+        db = self._make_db()
+        entry_id = db.add_entry("image", image_data=bytes(png_bytes))
+        self.assertIsNotNone(entry_id)
+
+        app = Adw.Application(application_id="com.clipman.TestThumb")
+        window = ClipmanWindow(application=app, db=db, monitor=None)
+
+        # Grab the stored path the same way _bind_entry_row does.
+        entry = db.get_entries(limit=1)[0]
+        size = 48
+        texture = window._thumbnail_texture(entry["image_path"], size=size)
+        self.assertIsNotNone(texture, "expected a Gdk.Texture thumbnail")
+
+        iw = texture.get_width()
+        ih = texture.get_height()
+
+        # The oversampled decode box: size * scale_factor * 2 (COVER
+        # headroom). Even at a large HiDPI scale this stays well under
+        # the 1600x1200 source — proving we no longer decode full-res.
+        scale = max(1, window.get_scale_factor())
+        box = size * scale * 2
+        self.assertLessEqual(iw, box)
+        self.assertLessEqual(ih, box)
+        self.assertLess(iw, 1600)
+        self.assertLess(ih, 1200)
+
+    def test_search_changed_debounces_refresh(self):
+        """Typing must NOT rebuild the list synchronously per keystroke.
+
+        Regression for the input-lag bug where every ``search-changed``
+        ran a ``LIKE '%q%'`` scan and rebuilt up to ~200 rows. The handler
+        now updates ``_search_query`` immediately but coalesces the refresh
+        behind a one-shot GLib timeout, so a burst of keystrokes schedules
+        a single pending source instead of N synchronous rebuilds.
+
+        Driven without real timing: assert the query updates and a debounce
+        id is armed but ``refresh`` is untouched, then fire the debounce
+        callback directly and assert exactly one refresh + a cleared id.
+        """
+        from clipman.window import ClipmanWindow
+
+        db = self._make_db()
+        app = Adw.Application(application_id="com.clipman.TestDebounce")
+        window = ClipmanWindow(application=app, db=db, monitor=None)
+
+        # Count refresh() calls without actually rebuilding the list.
+        refresh_calls = []
+        window.refresh = lambda: refresh_calls.append(True)
+
+        class _FakeEntry:
+            def __init__(self, text):
+                self._text = text
+
+            def get_text(self):
+                return self._text
+
+        # Two quick keystrokes: query tracks the latest, refresh stays
+        # untouched, and only ONE debounce source is left armed (the first
+        # is cancelled by the second).
+        window._on_search_changed(_FakeEntry("fo"))
+        first_id = window._search_debounce_id
+        self.assertNotEqual(first_id, 0)
+        window._on_search_changed(_FakeEntry("foo"))
+        self.assertEqual(window._search_query, "foo")
+        self.assertNotEqual(window._search_debounce_id, 0)
+        self.assertNotEqual(window._search_debounce_id, first_id)
+        self.assertEqual(refresh_calls, [])  # NOT called synchronously
+
+        # Remove the still-armed real GLib source so it can't fire into a
+        # later test's main loop, then simulate what the timeout would run.
+        from gi.repository import GLib
+        GLib.source_remove(window._search_debounce_id)
+        result = window._run_search_refresh()
+        self.assertFalse(result)  # one-shot: returns False
+        self.assertEqual(len(refresh_calls), 1)  # coalesced to a single refresh
+        self.assertEqual(window._search_debounce_id, 0)  # id cleared
+
+
+@unittest.skipUnless(_HAS_GTK and _ADW_INIT_OK,
+                     "GTK 4 + libadwaita not available")
+class TestKeyboardShortcuts(unittest.TestCase):
+    """The footer advertises ↵ Paste · ⌫ Delete · P Pin · Esc Close.
+
+    Exercises the action helpers directly (far more robust headless than
+    synthesizing real key events): select a row, call the helper, assert
+    the DB / selection state changed.
+    """
+
+    def _make_db(self):
+        from clipman import database
+
+        tmp = tempfile.mkdtemp(prefix="clipman-test-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        data_dir = Path(tmp) / "clipman"
+        images_dir = data_dir / "images"
+        db_path = data_dir / "clipman.db"
+        for target, value in (
+            ("clipman.database.DATA_DIR", data_dir),
+            ("clipman.database.IMAGES_DIR", images_dir),
+            ("clipman.database.DB_PATH", db_path),
+        ):
+            p = patch(target, value)
+            p.start()
+            self.addCleanup(p.stop)
+        db = database.ClipboardDB()
+        self.addCleanup(db.close)
+        return db
+
+    def _seeded_window(self, texts=("old", "mid", "new")):
+        from clipman.window import ClipmanWindow
+
+        db = self._make_db()
+        for text in texts:
+            db.add_entry("text", content_text=text)
+        app = Adw.Application(application_id="com.clipman.TestKeys")
+        window = ClipmanWindow(application=app, db=db, monitor=None)
+        window.refresh()
+        return db, window
+
+    def test_selected_item_falls_back_to_first(self):
+        _db, window = self._seeded_window()
+        window._selection.unselect_all()
+        item = window._selected_item()
+        self.assertIsNotNone(item)
+        # Falls back to index 0 (most-recent entry) when nothing selected.
+        self.assertIs(item, window._store.get_item(0))
+
+    def test_selected_item_prefers_selection(self):
+        _db, window = self._seeded_window()
+        window._selection.set_selected(1)
+        self.assertIs(window._selected_item(), window._store.get_item(1))
+
+    def test_delete_selected_removes_entry(self):
+        db, window = self._seeded_window()
+        window._selection.set_selected(0)
+        target_id = window._store.get_item(0).data["id"]
+
+        self.assertTrue(window._delete_selected())
+
+        remaining = {e["id"] for e in db.get_entries(limit=200)}
+        self.assertNotIn(target_id, remaining)
+        self.assertEqual(len(remaining), 2)
+
+    def test_delete_selected_empty_list_is_noop(self):
+        db, window = self._seeded_window(texts=())
+        # Nothing to delete -> returns False, doesn't raise.
+        self.assertFalse(window._delete_selected())
+        self.assertEqual(len(db.get_entries(limit=200)), 0)
+
+    def test_pin_selected_toggles_pin(self):
+        db, window = self._seeded_window()
+        window._selection.set_selected(0)
+        target_id = window._store.get_item(0).data["id"]
+        self.assertFalse(window._store.get_item(0).data["pinned"])
+
+        self.assertTrue(window._pin_selected())
+
+        pinned = {e["id"] for e in db.get_entries(limit=200) if e["pinned"]}
+        self.assertIn(target_id, pinned)
+
+        # Toggling again unpins. After refresh the model is rebuilt, and
+        # pinned entries sort first, so re-select index 0.
+        window._selection.set_selected(0)
+        self.assertTrue(window._pin_selected())
+        still_pinned = {
+            e["id"] for e in db.get_entries(limit=200) if e["pinned"]
+        }
+        self.assertNotIn(target_id, still_pinned)
+
+    def test_pin_selected_ignores_snippet_rows(self):
+        db, window = self._seeded_window(texts=())
+        db.add_snippet("greeting", "hello ${date}")
+        window._active_filter = "snippets"
+        window.refresh()
+
+        item = window._store.get_item(0)
+        self.assertEqual(item.kind, "snippet")
+        window._selection.set_selected(0)
+        # Snippets have no pin — helper must decline, not crash.
+        self.assertFalse(window._pin_selected())
+
+    def test_delete_selected_ignores_snippet_rows(self):
+        db, window = self._seeded_window(texts=())
+        db.add_snippet("greeting", "hello")
+        window._active_filter = "snippets"
+        window.refresh()
+
+        item = window._store.get_item(0)
+        self.assertEqual(item.kind, "snippet")
+        window._selection.set_selected(0)
+        self.assertFalse(window._delete_selected())
+        self.assertEqual(len(db.get_snippets()), 1)
+
+    def test_activate_selected_pastes_entry(self):
+        _db, window = self._seeded_window()
+        window._selection.set_selected(1)
+
+        pasted = []
+        window._paste_entry = lambda entry: pasted.append(entry)
+        self.assertTrue(window._activate_selected())
+        self.assertEqual(len(pasted), 1)
+        self.assertEqual(pasted[0]["content_text"], "mid")
+
+    def test_activate_selected_falls_back_to_first_when_none_selected(self):
+        _db, window = self._seeded_window()
+        window._selection.unselect_all()
+
+        pasted = []
+        window._paste_entry = lambda entry: pasted.append(entry)
+        self.assertTrue(window._activate_selected())
+        # Index 0 is the most-recent entry ("new").
+        self.assertEqual(pasted[0]["content_text"], "new")
+
+    def test_paste_snippet_increments_use_count(self):
+        """Pasting a snippet bumps use_count and the row meta shows it."""
+        db, window = self._seeded_window(texts=())
+        db.add_snippet("sig", "regards")
+        window._active_filter = "snippets"
+        window.refresh()
+        window._selection.set_selected(0)
+        window._copy_to_clipboard = lambda text: None
+        window._dispatch_paste = lambda: None
+        self.assertTrue(window._activate_selected())
+        snip = db.get_snippets()[0]
+        self.assertEqual(snip["use_count"], 1)
+
+    def test_activate_selected_pastes_snippet(self):
+        db, window = self._seeded_window(texts=())
+        db.add_snippet("sig", "regards")
+        window._active_filter = "snippets"
+        window.refresh()
+        window._selection.set_selected(0)
+
+        pasted = []
+        window._paste_snippet = lambda snip: pasted.append(snip)
+        self.assertTrue(window._activate_selected())
+        self.assertEqual(pasted[0]["name"], "sig")
+
+    def test_activate_selected_empty_list_is_noop(self):
+        _db, window = self._seeded_window(texts=())
+        window._paste_entry = lambda entry: self.fail("should not paste")
+        self.assertFalse(window._activate_selected())
 
 
 class TestEdgeStateDeclaration(unittest.TestCase):

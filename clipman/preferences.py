@@ -35,6 +35,7 @@ categories of message:
 
 import logging
 import os
+import re
 import subprocess
 import time
 
@@ -114,8 +115,16 @@ EVENT_KEYS = frozenset({
 })
 
 
-class ClipmanPreferences(Adw.PreferencesWindow):
-    """Six-pane preferences window.
+class ClipmanPreferences(Adw.Dialog):
+    """Six-pane preferences dialog with a left sidebar.
+
+    An ``Adw.Dialog`` (not a separate top-level window) so it presents
+    in-surface, anchored to the popup via ``present(parent)`` — a
+    top-level window opened *behind* the popup on Wayland and looked
+    unresponsive. The layout matches ``docs/design/preferences.html``:
+    a persistent icon+label sidebar on the left and the selected page on
+    the right (Adw.PreferencesDialog's bottom view-switcher tabs read as
+    cramped at this size).
 
     ``on_setting_changed`` is a callable that the parent window passes
     in; it's invoked with ``(key, value)`` whenever any persisted
@@ -123,30 +132,113 @@ class ClipmanPreferences(Adw.PreferencesWindow):
     without a restart.
     """
 
-    def __init__(self, db, parent, on_setting_changed=None):
+    def __init__(self, db, parent=None, on_setting_changed=None):
         super().__init__()
         self.db = db
         self._on_setting_changed = on_setting_changed or (lambda k, v: None)
         self._kbd_dialog = None  # held so the GC doesn't collect mid-capture
+        # As an Adw.Dialog this is NOT a Gtk.Window, so it can't be the
+        # parent of a Gtk.FileChooserNative. Keep the real toplevel (the
+        # ClipmanWindow passed in) for the backup/restore choosers.
+        self._parent_window = parent
 
-        self.set_modal(True)
-        self.set_transient_for(parent)
-        self.set_search_enabled(True)
-        self.set_default_size(820, 600)
+        self.set_title(_("Preferences"))
+        # Tall enough that the Appearance page fits without a scrollbar
+        # (Adw.Dialog clamps to the work area on small screens anyway).
+        self.set_content_width(760)
+        self.set_content_height(690)
 
-        self.add(self._build_appearance_page())
-        self.add(self._build_privacy_page())
-        self.add(self._build_shortcuts_page())
-        self.add(self._build_storage_page())
-        self.add(self._build_updates_page())
-        self.add(self._build_about_page())
+        # Pages carry their own title + icon; the sidebar reads both.
+        self._stack = Gtk.Stack()
+        self._stack.set_hexpand(True)
+        self._stack.set_vexpand(True)
+
+        self._sidebar = Gtk.ListBox()
+        self._sidebar.add_css_class("navigation-sidebar")
+        self._sidebar.set_selection_mode(Gtk.SelectionMode.BROWSE)
+        self._sidebar.connect("row-selected", self._on_nav_selected)
+
+        for pid, page in [
+            ("appearance", self._build_appearance_page()),
+            ("privacy", self._build_privacy_page()),
+            ("shortcuts", self._build_shortcuts_page()),
+            ("storage", self._build_storage_page()),
+            ("updates", self._build_updates_page()),
+            ("about", self._build_about_page()),
+        ]:
+            self._stack.add_named(page, pid)
+            row = Gtk.ListBoxRow()
+            box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+            box.set_margin_top(8)
+            box.set_margin_bottom(8)
+            box.set_margin_start(6)
+            box.set_margin_end(6)
+            box.append(Gtk.Image.new_from_icon_name(page.get_icon_name()))
+            box.append(Gtk.Label(label=page.get_title(), xalign=0))
+            row.set_child(box)
+            row._page_id = pid
+            row._page_title = page.get_title()
+            self._sidebar.append(row)
+
+        self._title_widget = Adw.WindowTitle(
+            title=_("Preferences"), subtitle=""
+        )
+        header = Adw.HeaderBar()
+        header.set_title_widget(self._title_widget)
+
+        sidebar_scroll = Gtk.ScrolledWindow()
+        sidebar_scroll.set_policy(
+            Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC
+        )
+        sidebar_scroll.set_child(self._sidebar)
+        sidebar_scroll.set_size_request(180, -1)
+        sidebar_scroll.add_css_class("prefs-sidebar")
+
+        content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        content.append(sidebar_scroll)
+        content.append(
+            Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
+        )
+        content.append(self._stack)
+
+        toolbar_view = Adw.ToolbarView()
+        toolbar_view.add_top_bar(header)
+        toolbar_view.set_content(content)
+        self.set_child(toolbar_view)
+
+        self._sidebar.select_row(self._sidebar.get_row_at_index(0))
+
+    def _on_nav_selected(self, _listbox, row):
+        if row is None:
+            return
+        self._stack.set_visible_child_name(row._page_id)
+        self._title_widget.set_title(row._page_title)
+
+    def show_page(self, page_id):
+        """Select ``page_id`` in the sidebar (deep links from edge states)."""
+        i = 0
+        while True:
+            row = self._sidebar.get_row_at_index(i)
+            if row is None:
+                break
+            if row._page_id == page_id:
+                self._sidebar.select_row(row)
+                break
+            i += 1
 
     # ------------------------------------------------------------------
     # Generic helpers
     # ------------------------------------------------------------------
 
     def _save(self, key, value):
-        """Persist + notify. ``value`` is coerced to ``str`` for SQLite."""
+        """Persist + notify. ``value`` is coerced to ``str`` for SQLite.
+
+        Booleans are stored lowercase (``true``/``false``) — Python's
+        ``str(True)`` is ``"True"``, which broke case-sensitive readers
+        (e.g. ``incognito_on_launch == "true"`` in app.py never matched).
+        """
+        if isinstance(value, bool):
+            value = "true" if value else "false"
         self.db.set_setting(key, str(value))
         try:
             self._on_setting_changed(key, value)
@@ -227,48 +319,81 @@ class ClipmanPreferences(Adw.PreferencesWindow):
             ),
         )
         theme_group.add(theme_row)
+
+        catppuccin_row = Adw.SwitchRow()
+        catppuccin_row.set_title(_("Catppuccin theme"))
+        catppuccin_row.set_subtitle(
+            _("Off: follow your system GNOME theme and accent color.")
+        )
+        catppuccin_row.set_active(self._get_bool("use_catppuccin", True))
+        catppuccin_row.connect(
+            "notify::active",
+            lambda row, _pspec: self._save(
+                "use_catppuccin", "true" if row.get_active() else "false"
+            ),
+        )
+        theme_group.add(catppuccin_row)
         page.add(theme_group)
 
         # --- Accent / font color group ------------------------------------
         accent_group = Adw.PreferencesGroup()
         accent_group.set_title(_("Accent"))
         accent_group.set_description(
-            _("Color applied to clip text in the popup.")
+            _("Accent for controls and highlights; font color for clip text.")
         )
+
+        # Accent colour picker — drives toggles, active tabs, focus rings,
+        # the recording pill. A picker (rather than the pale default) lets
+        # the user choose a high-contrast accent.
+        accent_color_row = Adw.ActionRow()
+        accent_color_row.set_title(_("Accent color"))
+        accent_color_row.set_subtitle(
+            _("Toggles, active tabs and highlights. Pick any colour or reset.")
+        )
+        cur_accent = self.db.get_setting("accent_color", "default")
+        accent_dialog = Gtk.ColorDialog()
+        accent_dialog.set_with_alpha(False)
+        self._accent_btn = Gtk.ColorDialogButton(dialog=accent_dialog)
+        self._accent_btn.set_valign(Gtk.Align.CENTER)
+        argba = Gdk.RGBA()
+        argba.parse(self._accent_display_hex(cur_accent))
+        self._accent_btn.set_rgba(argba)
+        self._accent_btn.connect("notify::rgba", self._on_accent_rgba)
+        accent_reset = Gtk.Button.new_from_icon_name("edit-undo-symbolic")
+        accent_reset.set_tooltip_text(_("Reset to theme default"))
+        accent_reset.add_css_class("flat")
+        accent_reset.set_valign(Gtk.Align.CENTER)
+        accent_reset.connect("clicked", self._on_accent_reset)
+        accent_color_row.add_suffix(self._accent_btn)
+        accent_color_row.add_suffix(accent_reset)
+        accent_group.add(accent_color_row)
 
         accent_row = Adw.ActionRow()
         accent_row.set_title(_("Font color"))
-        accent_row.set_subtitle(_("Pick a preset or fall back to default."))
-
-        swatches = Gtk.Box(
-            orientation=Gtk.Orientation.HORIZONTAL, spacing=6
+        accent_row.set_subtitle(
+            _("Pick any colour, or reset to the theme default.")
         )
-        swatches.set_valign(Gtk.Align.CENTER)
+
         current_font_color = self.db.get_setting("font_color", "default")
-        for preset_id, hex_value, tooltip in FONT_COLOR_PRESETS:
-            btn = Gtk.Button()
-            btn.set_tooltip_text(tooltip)
-            btn.add_css_class("circular")
-            btn.set_size_request(28, 28)
-            if hex_value:
-                # Inline CSS provider so the swatch fills with the preset.
-                provider = Gtk.CssProvider()
-                provider.load_from_data(
-                    f"button {{ background: {hex_value}; }}".encode(), -1
-                )
-                btn.get_style_context().add_provider(
-                    provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
-                )
-            else:
-                btn.set_label("A")
-            if preset_id == current_font_color:
-                btn.add_css_class("suggested-action")
-            btn.connect(
-                "clicked",
-                lambda _b, pid=preset_id: self._on_font_color_picked(pid),
-            )
-            swatches.append(btn)
-        accent_row.add_suffix(swatches)
+        color_dialog = Gtk.ColorDialog()
+        color_dialog.set_with_alpha(False)
+        self._font_color_btn = Gtk.ColorDialogButton(dialog=color_dialog)
+        self._font_color_btn.set_valign(Gtk.Align.CENTER)
+        rgba = Gdk.RGBA()
+        rgba.parse(self._font_color_display_hex(current_font_color))
+        self._font_color_btn.set_rgba(rgba)
+        self._font_color_btn.connect(
+            "notify::rgba", self._on_font_color_rgba
+        )
+
+        reset_btn = Gtk.Button.new_from_icon_name("edit-undo-symbolic")
+        reset_btn.set_tooltip_text(_("Reset to theme default"))
+        reset_btn.add_css_class("flat")
+        reset_btn.set_valign(Gtk.Align.CENTER)
+        reset_btn.connect("clicked", self._on_font_color_reset)
+
+        accent_row.add_suffix(self._font_color_btn)
+        accent_row.add_suffix(reset_btn)
         accent_group.add(accent_row)
         page.add(accent_group)
 
@@ -317,10 +442,47 @@ class ClipmanPreferences(Adw.PreferencesWindow):
 
         return page
 
-    def _on_font_color_picked(self, preset_id):
-        self._save("font_color", preset_id)
-        # Caller refreshes; we don't redraw the swatch row here because
-        # the user will see the new color in the popup itself.
+    def _accent_display_hex(self, value):
+        """Hex to show in the accent button (custom hex, or the Catppuccin
+        mauve default so the button isn't blank)."""
+        if isinstance(value, str) and re.fullmatch(r"#[0-9a-fA-F]{6}", value):
+            return value
+        return "#cba6f7"
+
+    def _on_accent_rgba(self, button, _pspec):
+        rgba = button.get_rgba()
+        hex_value = "#{:02x}{:02x}{:02x}".format(
+            round(rgba.red * 255),
+            round(rgba.green * 255),
+            round(rgba.blue * 255),
+        )
+        self._save("accent_color", hex_value)
+
+    def _on_accent_reset(self, _button):
+        self._save("accent_color", "default")
+
+    def _font_color_display_hex(self, value):
+        """Resolve a stored font_color (hex, legacy preset id, or
+        'default') to a hex the colour button can display."""
+        if isinstance(value, str) and re.fullmatch(r"#[0-9a-fA-F]{6}", value):
+            return value
+        for preset_id, hex_value, _tip in FONT_COLOR_PRESETS:
+            if preset_id == value and hex_value:
+                return hex_value
+        # 'default' — show a neutral so the button isn't misleading.
+        return "#9e9e9e"
+
+    def _on_font_color_rgba(self, button, _pspec):
+        rgba = button.get_rgba()
+        hex_value = "#{:02x}{:02x}{:02x}".format(
+            round(rgba.red * 255),
+            round(rgba.green * 255),
+            round(rgba.blue * 255),
+        )
+        self._save("font_color", hex_value)
+
+    def _on_font_color_reset(self, _button):
+        self._save("font_color", "default")
 
     # ------------------------------------------------------------------
     # Pane 2: Privacy
@@ -338,9 +500,10 @@ class ClipmanPreferences(Adw.PreferencesWindow):
         )
 
         incog_row = Adw.SwitchRow()
-        incog_row.set_title(_("Start in incognito mode"))
+        incog_row.set_title(_("Incognito mode"))
         incog_row.set_subtitle(
-            _("Useful on shared machines or before opening a password manager.")
+            _("Takes effect immediately and applies on every launch. "
+              "Useful on shared machines or before a password manager.")
         )
         incog_row.set_active(self._get_bool("incognito_on_launch", False))
         incog_row.connect(
@@ -481,8 +644,24 @@ class ClipmanPreferences(Adw.PreferencesWindow):
             self._toggle_row.set_subtitle(
                 keybindings.format_binding_for_display(binding)
             )
+        else:
+            # Registration failed (gsettings schema missing / non-GNOME):
+            # show the guided dialog instead of silently doing nothing
+            # (mockup shortcut-failed).
+            self._present_shortcut_failed()
         dialog.close()
         return True
+
+    def _present_shortcut_failed(self):
+        from clipman.edge_states import render_edge_state
+
+        parent = self._parent_window
+        if parent is not None and hasattr(parent, "_on_edge_action"):
+            parent._show_edge_state("shortcut-failed")
+            return
+        # Standalone (tests / no parent): present unwired on this dialog.
+        dlg = render_edge_state("shortcut-failed")
+        dlg.present(self)
 
     # ------------------------------------------------------------------
     # Pane 4: Storage
@@ -520,7 +699,9 @@ class ClipmanPreferences(Adw.PreferencesWindow):
         page.add(cap_group)
 
         backup_group = Adw.PreferencesGroup()
-        backup_group.set_title(_("Backup & restore"))
+        # Group titles are parsed as Pango markup — a bare "&" logs a
+        # markup-parse warning and drops the text; escape it.
+        backup_group.set_title(_("Backup &amp; restore"))
         backup_group.set_description(
             _("Export your history as a portable .clipman file.")
         )
@@ -570,7 +751,7 @@ class ClipmanPreferences(Adw.PreferencesWindow):
     def _on_backup_clicked(self, _btn):
         chooser = Gtk.FileChooserNative.new(
             _("Export backup"),
-            self,
+            self._parent_window,
             Gtk.FileChooserAction.SAVE,
             _("Save"),
             _("Cancel"),
@@ -595,7 +776,7 @@ class ClipmanPreferences(Adw.PreferencesWindow):
     def _on_restore_clicked(self, _btn):
         chooser = Gtk.FileChooserNative.new(
             _("Restore from backup"),
-            self,
+            self._parent_window,
             Gtk.FileChooserAction.OPEN,
             _("Open"),
             _("Cancel"),
