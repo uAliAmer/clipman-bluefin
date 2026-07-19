@@ -32,8 +32,12 @@ print("  shell-version:", d["shell-version"])
 PY
 
 echo "=== [3/5] Run upstream install.sh with dnf dep-step neutralized ==="
-tmp_install="$(mktemp)"
-sed -E 's|^[[:space:]]*sudo (dnf|apt) install.*|        echo "  [skip] deps pre-satisfied on atomic host"|' \
+# Must live inside SCRIPT_DIR: upstream install.sh derives its own paths from
+# `dirname "$0"`, so running a /tmp copy would resolve $SCRIPT_DIR to /tmp and
+# break every `$SCRIPT_DIR/extension/...` reference.
+tmp_install="$SCRIPT_DIR/.install-bluefin-patched.tmp.sh"
+trap 'rm -f "$tmp_install"' EXIT
+sed -E 's@^[[:space:]]*sudo (dnf|apt) install.*@        echo "  [skip] deps pre-satisfied on atomic host"@' \
     "$SCRIPT_DIR/install.sh" > "$tmp_install"
 # drop the apt continuation line (backslash-wrapped second line), if present
 sed -i '/gir1.2-gtk-4.0 gir1.2-adw-1 libadwaita-1-0/d' "$tmp_install"
